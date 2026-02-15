@@ -9,8 +9,8 @@ INSTALL_DIR="${ZEN_INSTALL_DIR:-$HOME/.local/bin}"
 # Detect architecture
 ARCH=$(uname -m)
 case "$ARCH" in
-    x86_64|amd64)   ARTIFACT="zen-x86_64-linux" ;;
-    aarch64|arm64)   ARTIFACT="zen-aarch64-linux" ;;
+    x86_64|amd64)   ARCH_TAG="x86_64" ;;
+    aarch64|arm64)   ARCH_TAG="aarch64" ;;
     *)
         echo "Error: Unsupported architecture: $ARCH"
         echo "Zen currently supports x86_64 and aarch64 Linux."
@@ -28,6 +28,32 @@ case "$OS" in
         exit 1
         ;;
 esac
+
+# Detect libc: use musl build if glibc is too old or absent
+LIBC_SUFFIX=""
+GLIBC_MIN_MAJOR=2
+GLIBC_MIN_MINOR=39
+
+if command -v ldd >/dev/null 2>&1; then
+    GLIBC_VER=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+' | tail -1)
+    if [ -n "$GLIBC_VER" ]; then
+        GLIBC_MAJOR=$(echo "$GLIBC_VER" | cut -d. -f1)
+        GLIBC_MINOR=$(echo "$GLIBC_VER" | cut -d. -f2)
+        if [ "$GLIBC_MAJOR" -lt "$GLIBC_MIN_MAJOR" ] 2>/dev/null || \
+           { [ "$GLIBC_MAJOR" -eq "$GLIBC_MIN_MAJOR" ] && [ "$GLIBC_MINOR" -lt "$GLIBC_MIN_MINOR" ]; } 2>/dev/null; then
+            LIBC_SUFFIX="-musl"
+            echo "Detected glibc $GLIBC_VER (< $GLIBC_MIN_MAJOR.$GLIBC_MIN_MINOR), using static (musl) binary."
+        fi
+    else
+        LIBC_SUFFIX="-musl"
+        echo "Could not detect glibc version, using static (musl) binary."
+    fi
+else
+    LIBC_SUFFIX="-musl"
+    echo "No glibc detected (musl/Alpine system?), using static (musl) binary."
+fi
+
+ARTIFACT="zen-${ARCH_TAG}-linux${LIBC_SUFFIX}"
 
 # Get latest release tag
 echo "Fetching latest release..."
@@ -57,13 +83,16 @@ echo ""
 
 # Check if install dir is in PATH
 case ":$PATH:" in
-    *":${INSTALL_DIR}:"*) ;;
-    *)
-        echo "Add this to your shell profile (~/.bashrc or ~/.zshrc):"
-        echo ""
-        echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
-        echo ""
-        ;;
+    *":${INSTALL_DIR}:"*) echo "✓ ${INSTALL_DIR} is already in PATH" ;;
+    *) echo "⚠ ${INSTALL_DIR} is not in PATH" ;;
 esac
 
+echo ""
+echo "Add these lines to ~/.bashrc (or ~/.zshrc), in this order:"
+echo ""
+echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+echo "  eval \"\$(zen hook bash)\"    # or: eval \"\$(zen hook zsh)\""
+echo ""
+echo "Then restart your shell or run: source ~/.bashrc"
+echo ""
 echo "Run 'zen --version' to verify."
