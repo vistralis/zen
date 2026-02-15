@@ -14,12 +14,22 @@ zen create myproject --template ml-base # From a saved template
 zen create myproject --ml --cuda 12.8   # With PyTorch + CUDA
 ```
 
+### `zen add <path>`
+Register an existing virtual environment. Accepts a venv root directory, `bin/python`, or `bin/activate`.
+
+```bash
+zen add /path/to/myenv              # Infer name from directory
+zen add /path/to/myenv -n custom    # Override name
+zen add /path/to/bin/python         # Resolve from python binary
+```
+
 ### `zen rm <name>`
 Remove an environment from disk and database.
 
 ```bash
 zen rm myproject          # Asks for confirmation
 zen rm myproject --yes    # Skip confirmation
+zen rm myproject --cached # Remove from database only, keep files on disk
 ```
 
 ### `zen activate [name]`
@@ -73,14 +83,18 @@ zen run myproject pip list
 
 ## Discovery
 
-### `zen list`
+### `zen list` (alias: `zen ls`)
 List all managed environments. Auto-detects terminal width and adjusts layout.
 
 ```bash
-zen list                  # Auto-detect best format
-zen list -f minimal       # Ultra-compact for narrow terminals
-zen list -f compact       # Medium format, no paths
-zen list -f wide          # Full table with all columns
+zen list                     # Auto-detect best format
+zen ls                       # Same as zen list
+zen list --format minimal    # Ultra-compact for narrow terminals
+zen list --format compact    # Medium format, no paths
+zen list --format wide       # Full table with all columns
+zen list -1                  # Names only, one per line
+zen list -l                  # Long format with paths
+zen list --sort date         # Sort by creation date
 ```
 
 ### `zen info <name>`

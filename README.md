@@ -136,10 +136,11 @@ Zen ships a built-in [MCP server](docs/mcp.md) so AI coding assistants can manag
 | Command | What it does |
 |---------|-------------|
 | `zen create <name>` | Create a new environment |
-| `zen rm <name>` | Remove an environment |
+| `zen add <path>` | Register an existing virtual environment |
+| `zen rm <name>` | Remove an environment (`--cached` for DB-only) |
 | `zen activate [name]` | Activate (smart selection when no name given) |
 | `zen deactivate` | Deactivate |
-| `zen list` | List all environments |
+| `zen list` / `zen ls` | List all environments (`-1` names only, `-l` long) |
 | `zen info <name>` | Detailed environment view |
 | `zen install [env] <pkgs>` | Install packages |
 | `zen uninstall [env] <pkgs>` | Remove packages |
