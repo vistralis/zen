@@ -178,17 +178,104 @@ zen note rm <uuid>
 
 ## Templates
 
-Save and reuse environment configurations.
+Save and reuse environment configurations. Templates record packages, versions, index URLs, and wheels as ordered steps that replay when creating new environments.
+
+### `zen template create <name>`
+Start an interactive session to build a new template.
 
 ```bash
-zen template create ml-base --python 3.12   # Start recording
-# Install packages...
-zen template exit                           # Save the template
-
-zen template list                           # View saved templates
-zen create newproject --template ml-base    # Create from template
-zen template rm ml-base                     # Remove a template
+zen template create ml-base                    # Default Python
+zen template create ml-base --python 3.12      # Specific Python version
 ```
+
+This opens the **template REPL** — an interactive session where you add packages step by step:
+
+```
+[ml-base:latest] (0 steps, 0 pkgs) > add numpy scipy
+[ml-base:latest] (1 step, 2 pkgs)  > add torch --index-url https://download.pytorch.org/whl/cu130
+[ml-base:latest] (2 steps, 3 pkgs) > list
+  Step 1: numpy, scipy
+  Step 2: torch  [index: https://download.pytorch.org/whl/cu130]
+[ml-base:latest] (2 steps, 3 pkgs) > save
+  ✓ Template 'ml-base:latest' saved (2 steps, 3 packages)
+```
+
+**REPL commands:**
+- `add <pkg> [pkg...]` — add packages to the current step
+- `add <pkg> --index-url <url>` — add with a custom index (creates a new step)
+- `add <pkg> --at N` / `--after N` / `--before N` — insert at a specific step
+- `drop <pkg>` — remove a package by name
+- `drop <N>` — remove an entire step by number
+- `list` — show current template contents
+- `save` — save and exit
+- `quit` — abort without saving
+
+> The REPL accepts `pip install`, `uv pip install`, and `zen install` syntax — prefixes are stripped automatically.
+
+### `zen template edit <name>`
+Edit an existing template. With no action, opens the interactive REPL pre-loaded with existing steps.
+
+```bash
+zen template edit ml-base                      # Interactive REPL
+
+# One-shot mode (no REPL):
+zen template edit ml-base add pandas           # Add a package
+zen template edit ml-base add torch --step 2   # Add to specific step
+zen template edit ml-base drop bitsandbytes    # Drop a package
+zen template edit ml-base drop 3               # Drop step 3
+```
+
+### `zen template inspect <name>`
+Docker-style layered view of a template's contents.
+
+```bash
+zen template inspect ml-base
+zen template inspect ml-base:v2       # Specific version
+```
+
+### `zen template list`
+List all saved templates with optional filters.
+
+```bash
+zen template list                     # All templates
+zen template list --name ml           # Filter by name substring
+zen template list --python 3.12       # Filter by Python version
+zen template list --has-pkg torch     # Filter by package name
+```
+
+### `zen template rm <name>`
+Remove a template.
+
+```bash
+zen template rm ml-base
+```
+
+### `zen template export <name>`
+Export a template to a portable TOML file for sharing.
+
+```bash
+zen template export ml-base                # Writes ml-base.toml
+zen template export ml-base -o custom.toml # Custom output path
+```
+
+### `zen template import <file>`
+Import a template from a TOML file.
+
+```bash
+zen template import ml-base.toml
+```
+
+### Creating environments from templates
+
+Use `--template` (or `--from`) with `zen create`:
+
+```bash
+zen create myenv --from ml-base            # Single template
+zen create myenv --from ml-base,extras     # Multiple templates (comma-separated)
+zen create myenv --from ml-base --strict   # Pin exact versions from snapshot
+```
+
+When combining multiple templates, Zen detects and warns about package version conflicts and index URL mismatches. The last template wins for any overlapping packages.
 
 ## Data Management
 

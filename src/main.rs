@@ -7,6 +7,7 @@ mod hooks;
 mod mcp;
 mod ops;
 mod printer;
+mod repl;
 mod table;
 mod types;
 mod utils;
@@ -84,6 +85,10 @@ enum Commands {
         /// Remove existing environment with the same name before creating
         #[arg(long)]
         rm: bool,
+
+        /// Extra positional args (hidden, used for typo detection)
+        #[arg(hide = true, trailing_var_arg = true)]
+        rest: Vec<String>,
     },
     /// Register an existing virtual environment
     Add {
@@ -92,6 +97,13 @@ enum Commands {
         /// Override the inferred environment name
         #[arg(short, long)]
         name: Option<String>,
+    },
+    /// Rename an existing environment
+    Rename {
+        /// Current name
+        old: String,
+        /// New name
+        new: String,
     },
     /// List all managed environments
     #[command(visible_alias = "ls")]
@@ -466,12 +478,75 @@ enum TemplateCommands {
     Save,
     /// Abort the current recording session
     Exit,
-    /// List all templates
-    List,
+    /// List all templates, or inspect one by name
+    List {
+        /// Optional template name to inspect
+        name: Option<String>,
+    },
     /// Remove a template
     Rm { name: String },
     /// Update unpinned dependencies for a template
     Update { name: String },
+    /// Inspect template contents (Docker-style layered view)
+    Inspect {
+        /// Template name (e.g., ml-cu130 or ml-cu130:latest)
+        name: String,
+    },
+    /// Edit a template — add/drop packages or steps
+    ///
+    /// One-shot mode:
+    ///   zen template edit ml-cu130 drop bitsandbytes
+    ///   zen template edit ml-cu130 drop 2
+    ///   zen template edit ml-cu130 add numpy --step 1
+    ///   zen template edit ml-cu130 add bb --wheel /path/to/bb.whl
+    ///
+    /// Interactive mode (no action → enters recording session):
+    ///   zen template edit ml-cu130
+    Edit {
+        /// Template name (e.g., ml-cu130 or ml-cu130:latest)
+        name: String,
+        /// Action: "add" or "drop"
+        action: Option<String>,
+        /// Target package name, step number, or packages to add
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+        /// Step number to add to (inherits install_args from existing step)
+        #[arg(long)]
+        step: Option<i64>,
+        /// Wheel file path for the package being added
+        #[arg(long)]
+        wheel: Option<String>,
+        /// Custom index URL
+        #[arg(long, name = "index-url")]
+        index_url: Option<String>,
+    },
+    /// Drop a package or step from the current recording session
+    Drop {
+        /// Package name or step number to remove
+        target: String,
+    },
+    /// Export a template to a portable TOML file
+    ///
+    /// Examples:
+    ///   zen template export ml-base               # writes ml-base.toml
+    ///   zen template export ml-base -o custom.toml
+    #[clap(name = "export")]
+    ExportTpl {
+        /// Template name (e.g., ml-base or ml-base:v2)
+        name: String,
+        /// Output file path (default: <name>.toml)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Import a template from a TOML file
+    ///
+    /// Examples:
+    ///   zen template import ml-base.toml
+    #[clap(name = "import")]
+    ImportTpl {
+        /// Path to TOML file
+        file: String,
+    },
 }
 
 /// Displays the branded landing screen when `zen` is invoked without a subcommand.
@@ -700,6 +775,154 @@ fn resolve_env_name(
 }
 
 ///
+/// Interactive REPL for template create/edit.
+///
+/// All edits live in-memory as `Vec<repl::Step>`. Only `save` flushes to DB.
+/// Commands are parsed by `repl::parse_repl_line` (returns `Result`) and
+/// executed by dedicated handlers — no nested loops in the dispatch path.
+fn template_repl(
+    db: &db::Database,
+    template_id: i64,
+    template_name: &str,
+    template_version: &str,
+    env_path: &str,
+    is_new: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rustyline::error::ReadlineError;
+
+    // Load existing packages from DB (for edit sessions)
+    let mut steps = if is_new {
+        Vec::new()
+    } else {
+        repl::load_steps_from_db(db, template_id)
+    };
+
+    let prompt = format!("{}:{}> ", template_name, template_version);
+    let use_uv = which::which("uv").is_ok();
+
+    // History file alongside the zen DB
+    let history_path = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".local/share/zen/repl_history"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/zen_repl_history"));
+
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let _ = rl.load_history(&history_path);
+
+    // Pre-seed with bash history (pip/zen/uv/conda commands) for Ctrl+R recall.
+    if let Ok(home) = std::env::var("HOME") {
+        let bash_hist = std::path::PathBuf::from(&home).join(".bash_history");
+        if let Ok(contents) = std::fs::read_to_string(&bash_hist) {
+            let keywords = ["pip", "zen", "uv", "conda"];
+            for line in contents.lines() {
+                let line = line.trim();
+                if !line.is_empty()
+                    && !line.starts_with('#')
+                    && keywords.iter().any(|k| line.contains(k))
+                {
+                    let _ = rl.add_history_entry(line);
+                }
+            }
+        }
+    }
+
+    // Cleanup on abort: delete empty templates, remove temp env
+    let cleanup = |db: &db::Database, tid: i64| {
+        let _ = db.clear_sessions();
+        if is_new
+            && let Ok(pkgs) = db.get_template_packages(tid)
+            && pkgs.is_empty()
+        {
+            let _ = db.delete_template_by_id(tid);
+        }
+        let _ = std::fs::remove_dir_all(env_path);
+    };
+
+    // Show status on REPL entry
+    repl::print_status(&steps, template_name, template_version);
+
+    loop {
+        match rl.readline(&prompt) {
+            Ok(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                rl.add_history_entry(line)?;
+
+                let line = repl::strip_tool_prefix(line);
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.is_empty() {
+                    continue;
+                }
+
+                match repl::parse_repl_line(&parts, steps.len()) {
+                    Err(msg) => {
+                        if !msg.is_empty() {
+                            eprintln!("  {} {}", "✗".red(), msg);
+                        }
+                    }
+                    Ok(repl::ReplCmd::Help(topic)) => {
+                        repl::handle_help(topic.as_deref());
+                    }
+                    Ok(repl::ReplCmd::List) => {
+                        repl::print_status(&steps, template_name, template_version);
+                    }
+                    Ok(repl::ReplCmd::Add(args)) => {
+                        if let Err(e) = repl::handle_add(&mut steps, args, env_path, use_uv) {
+                            eprintln!("  {} {}", "✗".red(), e);
+                        }
+                        repl::print_status(&steps, template_name, template_version);
+                    }
+                    Ok(repl::ReplCmd::Drop(target)) => {
+                        if let Err(e) = repl::handle_drop(&mut steps, &target) {
+                            eprintln!("  {} {}", "✗".red(), e);
+                        }
+                        repl::print_status(&steps, template_name, template_version);
+                    }
+                    Ok(repl::ReplCmd::Save) => {
+                        if let Err(e) = repl::handle_save(
+                            db,
+                            template_id,
+                            &steps,
+                            template_name,
+                            template_version,
+                        ) {
+                            eprintln!("  {} Save failed: {}", "✗".red(), e);
+                            continue;
+                        }
+                        let _ = std::fs::remove_dir_all(env_path);
+                        let _ = rl.save_history(&history_path);
+                        return Ok(());
+                    }
+                    Ok(repl::ReplCmd::Quit) => {
+                        cleanup(db, template_id);
+                        println!("\n  Session discarded.\n");
+                        let _ = rl.save_history(&history_path);
+                        return Ok(());
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                cleanup(db, template_id);
+                println!("\n  Session aborted.\n");
+                let _ = rl.save_history(&history_path);
+                return Ok(());
+            }
+            Err(ReadlineError::Eof) => {
+                cleanup(db, template_id);
+                println!("\n  Session aborted.\n");
+                let _ = rl.save_history(&history_path);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("  Error: {}", e);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parses arguments via clap, opens the SQLite registry, and dispatches to the
 /// appropriate command handler. Displays the branded landing screen when no
 /// subcommand is provided.
@@ -744,7 +967,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ml,
                 cuda,
                 rm,
+                rest,
             } => {
+                // Typo detection: catch reversed command order
+                // e.g., `zen create template ml-base` → `zen template create ml-base`
+                if name == "template" {
+                    let hint = if let Some(actual_name) = rest.first() {
+                        format!("zen template create {}", actual_name)
+                    } else {
+                        "zen template create <name>".to_string()
+                    };
+                    eprintln!("{} Did you mean {}?", "Hint:".yellow().bold(), hint.cyan());
+                    std::process::exit(1);
+                }
                 // Validate inputs
                 crate::validation::validate_name(&name, "Environment")?;
                 if let Some(ref py) = user_python {
@@ -833,6 +1068,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // Deduplicate: --from a,a should not apply 'a' twice
+                templates_to_apply.dedup_by(|a, b| a.1 == b.1 && a.2 == b.2);
+
                 println!("Creating environment '{}'...", name.cyan());
 
                 std::fs::create_dir_all(&cli.home)?;
@@ -920,7 +1158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let packages = db.get_template_packages(t_id)?;
 
                         // Detect conflicts with previously applied templates
-                        for (p_name, p_ver, _, _, pkg_install_args) in &packages {
+                        for (p_name, p_ver, _, _, pkg_install_args, _step) in &packages {
                             let pkg_lower = p_name.to_lowercase();
                             if let Some((prev_ver, prev_tpl, prev_args)) =
                                 installed_pkgs.get(&pkg_lower)
@@ -954,8 +1192,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut pkg_groups: std::collections::HashMap<Option<String>, Vec<String>> =
                             std::collections::HashMap::new();
 
-                        for (p_name, p_ver, is_pinned, _, pkg_install_args) in packages {
-                            let pkg_spec = if strict || is_pinned {
+                        for (p_name, p_ver, is_pinned, itype, pkg_install_args, _step) in packages {
+                            // Wheel path validation: if install_type is "wheel",
+                            // the install_args contains the wheel path — verify it exists.
+                            if itype == "wheel"
+                                && let Some(ref wheel_path) = pkg_install_args
+                                && !std::path::Path::new(wheel_path).exists()
+                            {
+                                eprintln!(
+                                    "  {} Wheel file for '{}' not found: {}",
+                                    "✗".red(),
+                                    p_name,
+                                    wheel_path.red()
+                                );
+                                eprintln!(
+                                    "    Fix with: {} or {}",
+                                    format!(
+                                        "zen template edit {}:{} drop {}",
+                                        t_name, t_ver, p_name
+                                    )
+                                    .cyan(),
+                                    format!(
+                                        "zen template edit {}:{} add {} --wheel /new/path.whl",
+                                        t_name, t_ver, p_name
+                                    )
+                                    .cyan()
+                                );
+                                continue; // Skip this package
+                            }
+
+                            let pkg_spec = if itype == "wheel" {
+                                // For wheels, use the wheel path directly
+                                pkg_install_args.clone().unwrap_or_else(|| {
+                                    if strict || is_pinned {
+                                        format!("{}=={}", p_name, p_ver)
+                                    } else {
+                                        p_name.clone()
+                                    }
+                                })
+                            } else if strict || is_pinned {
                                 format!("{}=={}", p_name, p_ver)
                             } else {
                                 p_name.clone()
@@ -969,10 +1244,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     pkg_install_args.clone(),
                                 ),
                             );
-                            pkg_groups
-                                .entry(pkg_install_args)
-                                .or_default()
-                                .push(pkg_spec);
+                            // Wheels use their own path, don't inherit group install_args
+                            let group_key = if itype == "wheel" {
+                                None
+                            } else {
+                                pkg_install_args
+                            };
+                            pkg_groups.entry(group_key).or_default().push(pkg_spec);
                         }
 
                         // Install each group with its specific args
@@ -1105,13 +1383,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Derive name from directory
-                let env_name_str = name.unwrap_or_else(|| {
-                    resolved
+                let env_name_str = if let Some(n) = name {
+                    n
+                } else {
+                    let basename = resolved
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
-                        .to_string()
-                });
+                        .to_string();
+
+                    // If it's a generic venv name, suggest a better one
+                    if utils::is_generic_venv_name(&basename) {
+                        if let Some(suggested) = utils::suggest_env_name(&resolved) {
+                            use std::io::{self, Write};
+                            print!(
+                                "  Name '{}' is generic. Suggested: {} [enter to accept, or type a name]: ",
+                                basename.dimmed(),
+                                suggested.cyan().bold()
+                            );
+                            io::stdout().flush().ok();
+                            let mut input = String::new();
+                            io::stdin().read_line(&mut input).ok();
+                            let input = input.trim();
+                            if input.is_empty() {
+                                suggested
+                            } else {
+                                input.to_string()
+                            }
+                        } else {
+                            basename
+                        }
+                    } else {
+                        basename
+                    }
+                };
                 let env_name = types::EnvName::new(&env_name_str).map_err(|e| e.to_string())?;
 
                 // Check for duplicates
@@ -1146,6 +1451,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     py_ver
                 );
                 println!("  {}", path_str.dimmed());
+            }
+            Commands::Rename { old, new } => {
+                let old_name = types::EnvName::new(&old).map_err(|e| e.to_string())?;
+                let new_name = types::EnvName::new(&new).map_err(|e| e.to_string())?;
+
+                // Verify old exists
+                if db.get_env_id(&old_name)?.is_none() {
+                    eprintln!("{} Environment '{}' not found.", "Error:".red(), old_name);
+                    return Ok(());
+                }
+
+                // Verify new doesn't exist
+                if db.get_env_id(&new_name)?.is_some() {
+                    eprintln!(
+                        "{} Environment '{}' already exists.",
+                        "Error:".red(),
+                        new_name
+                    );
+                    return Ok(());
+                }
+
+                if db.rename_environment(&old, &new)? {
+                    activity_log::log_activity("cli", "rename", &format!("{} -> {}", old, new));
+                    println!(
+                        "{} Renamed '{}' → '{}'",
+                        "✓".green(),
+                        old.dimmed(),
+                        new_name.to_string().bold()
+                    );
+                } else {
+                    eprintln!("{} Rename failed.", "Error:".red());
+                }
             }
             Commands::List {
                 pattern,
@@ -1744,7 +2081,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         let python = user_python.unwrap_or_else(|| "3.12".to_string());
-                        if db.get_active_session()?.is_some() {
+                        if !db.clear_stale_session()? {
                             eprintln!(
                                 "A recording session is already active. Please save or exit first."
                             );
@@ -1755,12 +2092,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let t_name = parts.next().unwrap();
                         let t_ver = parts.next().unwrap_or("latest");
 
-                        let temp_id = db.create_template(t_name, t_ver, &python)?;
+                        let (temp_id, is_new) = db.create_template(t_name, t_ver, &python)?;
                         let tmp_env =
                             std::env::temp_dir().join(format!("zen_tpl_{}_{}", t_name, t_ver));
                         println!(
-                            "Creating temporary recording environment at {}...",
-                            tmp_env.display()
+                            "{}",
+                            if is_new {
+                                format!("Creating template environment at {}...", tmp_env.display())
+                            } else {
+                                format!(
+                                    "Editing template '{}:{}' (environment at {})...",
+                                    t_name,
+                                    t_ver,
+                                    tmp_env.display()
+                                )
+                            }
                         );
 
                         let status = if let Ok(uv_path) = which::which("uv") {
@@ -1770,6 +2116,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .arg("--python")
                                 .arg(&python)
                                 .arg("--clear")
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
                                 .status()?
                         } else {
                             std::process::Command::new("python3")
@@ -1777,36 +2125,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .arg("venv")
                                 .arg(&tmp_env)
                                 .arg("--clear")
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
                                 .status()?
                         };
 
                         if status.success() {
                             let env_str = tmp_env.to_str().unwrap();
-                            if let Ok(_uv_path) = which::which("uv") {
-                                utils::run_in_env(
+                            if which::which("uv").is_ok() {
+                                utils::run_in_env_silent(
                                     env_str,
                                     "uv",
                                     &["pip", "install", "uv", "setuptools"],
                                 );
                             } else {
-                                utils::run_in_env(
+                                utils::run_in_env_silent(
                                     env_str,
                                     "pip",
                                     &["install", "--upgrade", "pip", "setuptools"],
                                 );
                             }
                             db.start_session(temp_id, env_str)?;
-                            println!(
-                                "{} Recording session started for template '{}'.",
-                                "✓".green(),
-                                name
-                            );
-                            println!("  Use {} to add packages.", "zen install <pkg>".cyan());
-                            println!("  Use {} to save and exit.", "zen template save".cyan());
+
+                            // Enter interactive REPL
+                            template_repl(&db, temp_id, t_name, t_ver, env_str, is_new)?;
+                        } else {
+                            eprintln!("{} Failed to create template environment.", "✗".red());
                         }
                     }
                     TemplateCommands::Save => {
-                        if let Some((t_id, path)) = db.get_active_session()? {
+                        if let Some((t_id, path, _)) = db.get_active_session()? {
                             // Only session packages (recorded during `zen install`) are stored.
                             // Transitive dependencies are resolved by the solver at apply time,
                             // preventing version churn from index mismatches.
@@ -1839,7 +2187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     TemplateCommands::Exit => {
-                        if let Some((_, path)) = db.get_active_session()? {
+                        if let Some((_, path, _)) = db.get_active_session()? {
                             println!("Aborting session. Cleaning up {}...", path);
                             std::fs::remove_dir_all(path).ok();
                             db.clear_sessions()?;
@@ -1848,8 +2196,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("No active recording session found.");
                         }
                     }
-                    TemplateCommands::List => {
+                    TemplateCommands::List { name } => {
+                        let pattern = name.as_deref();
                         let templates = db.get_all_templates_with_packages()?;
+                        let templates: Vec<_> = if let Some(pat) = pattern {
+                            let pat_lower = pat.to_lowercase();
+                            templates
+                                .into_iter()
+                                .filter(|(n, _, _, _)| n.to_lowercase().contains(&pat_lower))
+                                .collect()
+                        } else {
+                            templates
+                        };
                         use comfy_table::{
                             Attribute, Cell, ContentArrangement, Table,
                             modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL_CONDENSED,
@@ -1882,6 +2240,659 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     TemplateCommands::Update { name: _ } => {
                         println!("Template update is not yet implemented.");
+                    }
+                    TemplateCommands::Inspect { name } => {
+                        let mut parts = name.splitn(2, ':');
+                        let t_name = parts.next().unwrap();
+                        let t_ver = parts.next().unwrap_or("latest");
+
+                        let t_id = db.get_template_id(t_name, t_ver)?;
+                        match t_id {
+                            None => {
+                                eprintln!(
+                                    "{} Template '{}:{}' not found.",
+                                    "✗".red(),
+                                    t_name,
+                                    t_ver
+                                );
+                            }
+                            Some(id) => {
+                                let packages = db.get_template_packages(id)?;
+                                let meta = db.get_template_by_id(id)?;
+                                let py_ver =
+                                    meta.as_ref().map(|(_, _, p)| p.as_str()).unwrap_or("?");
+
+                                // Group by step
+                                let mut steps: std::collections::BTreeMap<
+                                    i64,
+                                    Vec<&(String, String, bool, String, Option<String>, i64)>,
+                                > = std::collections::BTreeMap::new();
+                                for pkg in &packages {
+                                    steps.entry(pkg.5).or_default().push(pkg);
+                                }
+
+                                println!(
+                                    "\n{} {}:{} — Python {} — {} step(s), {} package(s)\n",
+                                    "●".bold(),
+                                    t_name.bold(),
+                                    t_ver,
+                                    py_ver,
+                                    steps.len(),
+                                    packages.len()
+                                );
+
+                                for (step_num, step_pkgs) in &steps {
+                                    // Show step header with install_args if any
+                                    let step_args = step_pkgs
+                                        .first()
+                                        .and_then(|p| p.4.as_deref())
+                                        .filter(|a| !a.is_empty());
+
+                                    if let Some(args) = step_args {
+                                        // Only show args for pypi steps
+                                        if step_pkgs.first().map(|p| p.3.as_str()) != Some("wheel")
+                                        {
+                                            println!(
+                                                "  {} {} ─ {}",
+                                                format!("Step {}", step_num).bold(),
+                                                "".dimmed(),
+                                                args.dimmed()
+                                            );
+                                        } else {
+                                            println!("  {}", format!("Step {}", step_num).bold());
+                                        }
+                                    } else {
+                                        println!("  {}", format!("Step {}", step_num).bold());
+                                    }
+
+                                    for pkg in step_pkgs {
+                                        let name_col = format!("    {:<24}", pkg.0);
+                                        let ver_col = format!("{:<20}", pkg.1);
+                                        let type_col = &pkg.3;
+
+                                        if type_col == "wheel" {
+                                            let wheel_path =
+                                                pkg.4.as_deref().unwrap_or("(unknown path)");
+                                            let exists = std::path::Path::new(wheel_path).exists();
+                                            if exists {
+                                                println!(
+                                                    "{}{}{}  {}",
+                                                    name_col,
+                                                    ver_col,
+                                                    "wheel".cyan(),
+                                                    wheel_path.green()
+                                                );
+                                            } else {
+                                                println!(
+                                                    "{}{}{}  {} {}",
+                                                    name_col,
+                                                    ver_col,
+                                                    "wheel".cyan(),
+                                                    wheel_path.red(),
+                                                    "← missing".red().bold()
+                                                );
+                                            }
+                                        } else {
+                                            println!(
+                                                "{}{}{}",
+                                                name_col,
+                                                ver_col,
+                                                type_col.dimmed()
+                                            );
+                                        }
+                                    }
+                                    println!();
+                                }
+                            }
+                        }
+                    }
+                    TemplateCommands::Edit {
+                        name,
+                        action,
+                        args,
+                        step,
+                        wheel,
+                        index_url,
+                    } => {
+                        let mut parts = name.splitn(2, ':');
+                        let t_name = parts.next().unwrap();
+                        let t_ver = parts.next().unwrap_or("latest");
+
+                        let t_id = match db.get_template_id(t_name, t_ver)? {
+                            Some(id) => id,
+                            None => {
+                                eprintln!(
+                                    "{} Template '{}:{}' not found.",
+                                    "✗".red(),
+                                    t_name,
+                                    t_ver
+                                );
+                                return Ok(());
+                            }
+                        };
+
+                        match action.as_deref() {
+                            Some("drop") => {
+                                if args.is_empty() {
+                                    eprintln!(
+                                        "Usage: zen template edit <name> drop <package_name|step_number>"
+                                    );
+                                    return Ok(());
+                                }
+                                let target = &args[0];
+                                // Auto-detect: number → step, string → package
+                                if let Ok(step_num) = target.parse::<i64>() {
+                                    let removed = db.remove_template_step(t_id, step_num)?;
+                                    if removed > 0 {
+                                        println!(
+                                            "{} Removed step {} ({} package(s)) from '{}:{}'.",
+                                            "✓".green(),
+                                            step_num,
+                                            removed,
+                                            t_name,
+                                            t_ver
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "{} Step {} not found in '{}:{}'.",
+                                            "✗".red(),
+                                            step_num,
+                                            t_name,
+                                            t_ver
+                                        );
+                                    }
+                                } else if db.remove_template_package(t_id, target)? {
+                                    println!(
+                                        "{} Removed '{}' from '{}:{}'.",
+                                        "✓".green(),
+                                        target,
+                                        t_name,
+                                        t_ver
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "{} Package '{}' not found in '{}:{}'.",
+                                        "✗".red(),
+                                        target,
+                                        t_name,
+                                        t_ver
+                                    );
+                                }
+                            }
+                            Some("add") => {
+                                if args.is_empty() {
+                                    eprintln!(
+                                        "Usage: zen template edit <name> add <packages...> [--step N] [--wheel /path] [--index-url URL]"
+                                    );
+                                    return Ok(());
+                                }
+                                let target_step = if let Some(s) = step {
+                                    s
+                                } else {
+                                    db.get_next_step(t_id)?
+                                };
+
+                                // Build install_args
+                                let install_args = if let Some(ref url) = index_url {
+                                    Some(format!("--index-url {}", url))
+                                } else if step.is_some() {
+                                    // Inherit install_args from existing step
+                                    let pkgs = db.get_template_packages(t_id)?;
+                                    pkgs.iter()
+                                        .find(|p| p.5 == target_step)
+                                        .and_then(|p| p.4.clone())
+                                } else {
+                                    None
+                                };
+
+                                for pkg_name in &args {
+                                    let (name, ver, itype, iargs) = if let Some(ref whl) = wheel {
+                                        let whl_name = utils::normalize_wheel_name(whl)
+                                            .unwrap_or_else(|| pkg_name.clone());
+                                        (whl_name, "0.0.0".to_string(), "wheel", Some(whl.clone()))
+                                    } else {
+                                        (
+                                            pkg_name.clone(),
+                                            "latest".to_string(),
+                                            "pypi",
+                                            install_args.clone(),
+                                        )
+                                    };
+                                    db.add_template_package(
+                                        t_id,
+                                        &name,
+                                        &ver,
+                                        true,
+                                        itype,
+                                        iargs.as_deref(),
+                                        target_step,
+                                    )?;
+                                    println!(
+                                        "{} Added '{}' to '{}:{}' step {}.",
+                                        "✓".green(),
+                                        name,
+                                        t_name,
+                                        t_ver,
+                                        target_step
+                                    );
+                                }
+                            }
+                            Some(other) => {
+                                eprintln!(
+                                    "{} Unknown action '{}'. Use 'add' or 'drop'.",
+                                    "✗".red(),
+                                    other
+                                );
+                            }
+                            None => {
+                                // Interactive mode: fresh venv + replay steps + REPL
+                                if !db.clear_stale_session()? {
+                                    eprintln!(
+                                        "A recording session is already active. Please save or exit first."
+                                    );
+                                    return Ok(());
+                                }
+
+                                let meta = db.get_template_by_id(t_id)?;
+                                let python = meta
+                                    .as_ref()
+                                    .map(|(_, _, p)| p.clone())
+                                    .unwrap_or_else(|| "3.12".to_string());
+
+                                let tmp_env = std::env::temp_dir()
+                                    .join(format!("zen_tpl_edit_{}_{}", t_name, t_ver));
+
+                                // Always start from scratch (Docker-like rebuild)
+                                println!("Rebuilding environment for '{}:{}'...", t_name, t_ver);
+
+                                let status = if let Ok(uv_path) = which::which("uv") {
+                                    std::process::Command::new(uv_path)
+                                        .arg("venv")
+                                        .arg(&tmp_env)
+                                        .arg("--python")
+                                        .arg(&python)
+                                        .arg("--clear")
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .status()?
+                                } else {
+                                    std::process::Command::new("python3")
+                                        .arg("-m")
+                                        .arg("venv")
+                                        .arg(&tmp_env)
+                                        .arg("--clear")
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .status()?
+                                };
+
+                                if !status.success() {
+                                    eprintln!("{} Failed to create edit environment.", "✗".red());
+                                    return Ok(());
+                                }
+
+                                let env_str = tmp_env.to_str().unwrap();
+                                let use_uv = which::which("uv").is_ok();
+
+                                // Bootstrap (silent)
+                                if use_uv {
+                                    utils::run_in_env_silent(
+                                        env_str,
+                                        "uv",
+                                        &["pip", "install", "uv", "setuptools"],
+                                    );
+                                } else {
+                                    utils::run_in_env_silent(
+                                        env_str,
+                                        "pip",
+                                        &["install", "--upgrade", "pip", "setuptools"],
+                                    );
+                                }
+
+                                // Replay existing template steps into the fresh venv
+                                let packages = db.get_template_packages(t_id)?;
+                                if !packages.is_empty() {
+                                    // Group by step for ordered replay
+                                    let mut steps: std::collections::BTreeMap<
+                                        i64,
+                                        (Option<String>, Vec<(String, String)>),
+                                    > = std::collections::BTreeMap::new();
+                                    for (p_name, _p_ver, _pinned, itype, iargs, step) in &packages {
+                                        let entry = steps
+                                            .entry(*step)
+                                            .or_insert_with(|| (iargs.clone(), Vec::new()));
+                                        entry.1.push((p_name.clone(), itype.clone()));
+                                    }
+
+                                    for (step_num, (install_args, pkgs)) in &steps {
+                                        let mut cmd_args: Vec<String> = if use_uv {
+                                            vec!["pip".to_string(), "install".to_string()]
+                                        } else {
+                                            vec!["install".to_string()]
+                                        };
+
+                                        // Add index-url from install_args if present
+                                        if let Some(args) = install_args {
+                                            let parts: Vec<&str> =
+                                                args.split_whitespace().collect();
+                                            for a in &parts {
+                                                cmd_args.push(a.to_string());
+                                            }
+                                        }
+
+                                        // Add package names (wheels use path from install_args)
+                                        for (name, itype) in pkgs {
+                                            if itype == "wheel"
+                                                && let Some(args) = install_args
+                                            {
+                                                if !cmd_args.iter().any(|a| a.ends_with(".whl")) {
+                                                    cmd_args.push(args.clone());
+                                                }
+                                            } else {
+                                                cmd_args.push(name.clone());
+                                            }
+                                        }
+
+                                        let installer = if use_uv { "uv" } else { "pip" };
+                                        let args_ref: Vec<&str> =
+                                            cmd_args.iter().map(|s| s.as_str()).collect();
+
+                                        print!("  Replaying step {}...", step_num);
+                                        let ok =
+                                            utils::run_in_env_silent(env_str, installer, &args_ref);
+                                        if ok {
+                                            println!(" {}", "✓".green());
+                                        } else {
+                                            println!(" {}", "✗".red());
+                                            eprintln!(
+                                                "  {} Step {} replay failed. Entering REPL anyway — use 'drop {}' to remove it.",
+                                                "⚠".yellow(),
+                                                step_num,
+                                                step_num
+                                            );
+                                        }
+                                    }
+                                }
+
+                                db.start_session(t_id, env_str)?;
+
+                                // Enter interactive REPL
+                                template_repl(&db, t_id, t_name, t_ver, env_str, false)?;
+                            }
+                        }
+                    }
+                    TemplateCommands::Drop { target } => {
+                        // Works during active session only
+                        match db.get_active_session()? {
+                            None => {
+                                eprintln!(
+                                    "{} No active session. Use this during {} or {}.",
+                                    "✗".red(),
+                                    "zen template create".cyan(),
+                                    "zen template edit".cyan()
+                                );
+                            }
+                            Some((t_id, _path, _)) => {
+                                if let Ok(step_num) = target.parse::<i64>() {
+                                    let removed = db.remove_template_step(t_id, step_num)?;
+                                    if removed > 0 {
+                                        println!(
+                                            "{} Dropped step {} ({} package(s)).",
+                                            "✓".green(),
+                                            step_num,
+                                            removed
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "{} Step {} not found in current session.",
+                                            "✗".red(),
+                                            step_num
+                                        );
+                                    }
+                                } else if db.remove_template_package(t_id, &target)? {
+                                    println!("{} Dropped '{}' from session.", "✓".green(), target);
+                                } else {
+                                    eprintln!(
+                                        "{} Package '{}' not found in current session.",
+                                        "✗".red(),
+                                        target
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    TemplateCommands::ExportTpl { name, output } => {
+                        let mut parts = name.splitn(2, ':');
+                        let t_name = parts.next().unwrap();
+                        let t_ver = parts.next().unwrap_or("latest");
+
+                        let t_id = match db.get_template_id(t_name, t_ver)? {
+                            Some(id) => id,
+                            None => {
+                                eprintln!(
+                                    "{} Template '{}:{}' not found.",
+                                    "✗".red(),
+                                    t_name,
+                                    t_ver
+                                );
+                                return Ok(());
+                            }
+                        };
+
+                        let meta = db.get_template_by_id(t_id)?;
+                        let py_ver = meta.as_ref().map(|(_, _, p)| p.as_str()).unwrap_or("3.12");
+                        let packages = db.get_template_packages(t_id)?;
+
+                        // Group packages by step
+                        let mut steps: std::collections::BTreeMap<
+                            i64,
+                            (Option<String>, Vec<toml::Value>),
+                        > = std::collections::BTreeMap::new();
+                        for (p_name, p_ver, _pinned, itype, iargs, step) in &packages {
+                            let entry = steps
+                                .entry(*step)
+                                .or_insert_with(|| (iargs.clone(), Vec::new()));
+                            let mut pkg = toml::map::Map::new();
+                            pkg.insert("name".to_string(), toml::Value::String(p_name.clone()));
+                            pkg.insert("version".to_string(), toml::Value::String(p_ver.clone()));
+                            if itype != "pypi" {
+                                pkg.insert("type".to_string(), toml::Value::String(itype.clone()));
+                            }
+                            if itype == "wheel"
+                                && let Some(path) = iargs
+                            {
+                                pkg.insert("path".to_string(), toml::Value::String(path.clone()));
+                            }
+                            entry.1.push(toml::Value::Table(pkg));
+                        }
+
+                        // Build TOML structure
+                        let mut doc = toml::map::Map::new();
+
+                        // [template] section
+                        let mut tpl = toml::map::Map::new();
+                        tpl.insert("name".to_string(), toml::Value::String(t_name.to_string()));
+                        tpl.insert(
+                            "version".to_string(),
+                            toml::Value::String(t_ver.to_string()),
+                        );
+                        tpl.insert(
+                            "python".to_string(),
+                            toml::Value::String(py_ver.to_string()),
+                        );
+                        doc.insert("template".to_string(), toml::Value::Table(tpl));
+
+                        // [[step]] array
+                        let mut step_arr = Vec::new();
+                        for (install_args, pkgs) in steps.values() {
+                            let mut step_table = toml::map::Map::new();
+                            if let Some(args) = install_args {
+                                // Parse --index-url from install_args
+                                let parts: Vec<&str> = args.split_whitespace().collect();
+                                for i in 0..parts.len() {
+                                    if parts[i] == "--index-url"
+                                        && let Some(url) = parts.get(i + 1)
+                                    {
+                                        step_table.insert(
+                                            "index_url".to_string(),
+                                            toml::Value::String(url.to_string()),
+                                        );
+                                    }
+                                    if parts[i] == "--extra-index-url"
+                                        && let Some(url) = parts.get(i + 1)
+                                    {
+                                        step_table.insert(
+                                            "extra_index_url".to_string(),
+                                            toml::Value::String(url.to_string()),
+                                        );
+                                    }
+                                }
+                            }
+                            step_table
+                                .insert("packages".to_string(), toml::Value::Array(pkgs.clone()));
+                            step_arr.push(toml::Value::Table(step_table));
+                        }
+                        doc.insert("step".to_string(), toml::Value::Array(step_arr));
+
+                        let toml_str = toml::to_string_pretty(&toml::Value::Table(doc))?;
+
+                        let out_path = output.unwrap_or_else(|| format!("{}.toml", t_name));
+                        std::fs::write(&out_path, &toml_str)?;
+                        println!(
+                            "{} Exported '{}:{}' → {}",
+                            "✓".green(),
+                            t_name,
+                            t_ver,
+                            out_path.cyan()
+                        );
+                    }
+                    TemplateCommands::ImportTpl { file } => {
+                        let content = match std::fs::read_to_string(&file) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("{} Cannot read '{}': {}", "✗".red(), file, e);
+                                return Ok(());
+                            }
+                        };
+                        let doc: toml::Value = match content.parse() {
+                            Ok(d) => d,
+                            Err(e) => {
+                                eprintln!("{} TOML parse error: {}", "✗".red(), e);
+                                return Ok(());
+                            }
+                        };
+
+                        let tpl = match doc.get("template") {
+                            Some(t) => t,
+                            None => {
+                                eprintln!("{} Missing [template] section in TOML.", "✗".red());
+                                return Ok(());
+                            }
+                        };
+                        let t_name = match tpl.get("name").and_then(|v: &toml::Value| v.as_str()) {
+                            Some(n) => n,
+                            None => {
+                                eprintln!("{} Missing template.name in TOML.", "✗".red());
+                                return Ok(());
+                            }
+                        };
+                        let t_ver = tpl
+                            .get("version")
+                            .and_then(|v: &toml::Value| v.as_str())
+                            .unwrap_or("latest");
+                        let py_ver = tpl
+                            .get("python")
+                            .and_then(|v: &toml::Value| v.as_str())
+                            .unwrap_or("3.12");
+
+                        // Delete existing template with same name:version if present
+                        if let Some(existing_id) = db.get_template_id(t_name, t_ver)? {
+                            db.delete_template_by_id(existing_id)?;
+                        }
+
+                        let (t_id, _) = db.create_template(t_name, t_ver, py_ver)?;
+
+                        let steps = match doc.get("step").and_then(|v: &toml::Value| v.as_array()) {
+                            Some(s) => s,
+                            None => {
+                                eprintln!("{} Missing [[step]] array in TOML.", "✗".red());
+                                return Ok(());
+                            }
+                        };
+
+                        let mut total_pkgs = 0usize;
+                        for (step_num, step_val) in steps.iter().enumerate() {
+                            let step_tbl = step_val.as_table();
+                            // Build install_args from index_url / extra_index_url
+                            let mut install_parts = Vec::new();
+                            if let Some(tbl) = step_tbl {
+                                if let Some(url) = tbl.get("index_url").and_then(|v| v.as_str()) {
+                                    install_parts.push(format!("--index-url {}", url));
+                                }
+                                if let Some(url) =
+                                    tbl.get("extra_index_url").and_then(|v| v.as_str())
+                                {
+                                    install_parts.push(format!("--extra-index-url {}", url));
+                                }
+                            }
+                            let install_args = if install_parts.is_empty() {
+                                None
+                            } else {
+                                Some(install_parts.join(" "))
+                            };
+
+                            if let Some(tbl) = step_tbl
+                                && let Some(pkgs) = tbl.get("packages").and_then(|v| v.as_array())
+                            {
+                                for pkg in pkgs {
+                                    let pkg_tbl = match pkg.as_table() {
+                                        Some(t) => t,
+                                        None => continue,
+                                    };
+                                    let name = pkg_tbl
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown");
+                                    let version = pkg_tbl
+                                        .get("version")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("latest");
+                                    let itype = pkg_tbl
+                                        .get("type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("pypi");
+                                    let iargs = if itype == "wheel" {
+                                        pkg_tbl
+                                            .get("path")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                    } else {
+                                        install_args.clone()
+                                    };
+
+                                    db.add_template_package(
+                                        t_id,
+                                        name,
+                                        version,
+                                        true,
+                                        itype,
+                                        iargs.as_deref(),
+                                        step_num as i64,
+                                    )?;
+                                    total_pkgs += 1;
+                                }
+                            }
+                        }
+
+                        println!(
+                            "{} Imported '{}:{}' from {} ({} package(s), {} step(s)).",
+                            "✓".green(),
+                            t_name,
+                            t_ver,
+                            file.cyan(),
+                            total_pkgs,
+                            steps.len()
+                        );
                     }
                 }
             }
@@ -1987,64 +2998,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     utils::run_in_env(&target_path, "pip", &cmd_args[1..])
                 };
 
-                if success {
-                    if is_session {
-                        let t_id = target_id.ok_or("Missing template ID for session")?;
-                        let installed = utils::get_packages(&target_path);
+                // Record packages to session or audit log.
+                // BUG FIX: Always scan even on partial failure — some packages
+                // may have installed successfully before the batch failed.
+                if is_session {
+                    let t_id = target_id.ok_or("Missing template ID for session")?;
+                    let installed = utils::get_packages(&target_path);
+                    let step = db.get_next_step(t_id)?;
 
-                        // Capture install_args (e.g., --index-url, --extra-index-url)
-                        // to preserve CUDA version and custom indices
-                        let install_args_str: Option<String> = {
-                            let mut parts = Vec::new();
-                            if let Some(ref url) = index_url {
-                                parts.push(format!("--index-url {}", url));
+                    // Capture install_args (e.g., --index-url, --extra-index-url)
+                    let install_args_str: Option<String> = {
+                        let mut parts = Vec::new();
+                        if let Some(ref url) = index_url {
+                            parts.push(format!("--index-url {}", url));
+                        }
+                        if let Some(ref url) = extra_index_url {
+                            parts.push(format!("--extra-index-url {}", url));
+                        }
+                        if parts.is_empty() {
+                            None
+                        } else {
+                            Some(parts.join(" "))
+                        }
+                    };
+
+                    let mut recorded = 0usize;
+                    for pkg_name in &packages {
+                        // Resolve the pip name for matching
+                        let (base_name, is_wheel, wheel_path) = if pkg_name.starts_with("torch-cu")
+                        {
+                            ("torch".to_string(), false, None)
+                        } else if pkg_name.ends_with(".whl") || pkg_name.contains(".whl") {
+                            // Wheel file — extract distribution name from PEP 427 filename
+                            match utils::normalize_wheel_name(pkg_name) {
+                                Some(name) => (name, true, Some(pkg_name.clone())),
+                                None => (pkg_name.clone(), false, None),
                             }
-                            if let Some(ref url) = extra_index_url {
-                                parts.push(format!("--extra-index-url {}", url));
-                            }
-                            if parts.is_empty() {
-                                None
-                            } else {
-                                Some(parts.join(" "))
-                            }
+                        } else {
+                            (pkg_name.clone(), false, None)
                         };
 
-                        for pkg_name in &packages {
-                            let base_name = if pkg_name.starts_with("torch-cu") {
-                                "torch"
+                        // Match against installed packages (normalize both sides)
+                        let norm_base = utils::normalize_package_name(&base_name);
+                        if let Some(pkg) = installed
+                            .iter()
+                            .find(|p| utils::normalize_package_name(&p.name) == norm_base)
+                        {
+                            let ver = pkg.version.as_deref().unwrap_or("unknown");
+                            let (itype, iargs) = if is_wheel {
+                                ("wheel", wheel_path.as_deref())
+                            } else if pkg.is_editable {
+                                ("edit", install_args_str.as_deref())
                             } else {
-                                pkg_name
+                                ("pypi", install_args_str.as_deref())
                             };
-                            if let Some(pkg) = installed.iter().find(|p| p.name == base_name) {
-                                let ver = pkg.version.as_deref().unwrap_or("unknown");
-                                db.add_template_package(
-                                    t_id,
-                                    &pkg.name,
-                                    ver,
-                                    true,
-                                    if pkg.is_editable { "edit" } else { "pypi" },
-                                    install_args_str.as_deref(),
-                                )?;
-                            }
-                        }
-                    } else {
-                        let e_id = target_id.ok_or("Missing environment ID")?;
-                        // Log to audit log
-                        let installed = utils::get_packages(&target_path);
-                        for pkg_name in &packages {
-                            let base_name = if pkg_name.starts_with("torch-cu") {
-                                "torch"
-                            } else {
-                                pkg_name
-                            };
-                            if let Some(pkg) = installed.iter().find(|p| p.name == base_name) {
-                                let ver = pkg.version.as_deref().unwrap_or("unknown");
-                                db.log_package(e_id, &pkg.name, ver, "pypi")?;
-                            }
+                            db.add_template_package(
+                                t_id, &pkg.name, ver, true, itype, iargs, step,
+                            )?;
+                            recorded += 1;
                         }
                     }
+
+                    if !success && recorded > 0 {
+                        eprintln!(
+                            "  {} Some packages failed, but {} successfully-installed package(s) were recorded.",
+                            "⚠".yellow(),
+                            recorded
+                        );
+                    }
+                } else if success {
+                    let e_id = target_id.ok_or("Missing environment ID")?;
+                    let installed = utils::get_packages(&target_path);
+                    for pkg_name in &packages {
+                        let base_name = if pkg_name.starts_with("torch-cu") {
+                            "torch".to_string()
+                        } else if pkg_name.ends_with(".whl") || pkg_name.contains(".whl") {
+                            utils::normalize_wheel_name(pkg_name)
+                                .unwrap_or_else(|| pkg_name.clone())
+                        } else {
+                            pkg_name.clone()
+                        };
+                        let norm_base = utils::normalize_package_name(&base_name);
+                        if let Some(pkg) = installed
+                            .iter()
+                            .find(|p| utils::normalize_package_name(&p.name) == norm_base)
+                        {
+                            let ver = pkg.version.as_deref().unwrap_or("unknown");
+                            db.log_package(e_id, &pkg.name, ver, "pypi")?;
+                        }
+                    }
+                }
+
+                if success {
                     println!("Installation complete.");
-                    // Extract env name for logging
                     let log_env = std::path::Path::new(&target_path)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
@@ -2287,7 +3333,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     name: String,
                     version: String,
                     python_version: String,
-                    packages: Vec<(String, String, bool, String, Option<String>)>, // includes install_args
+                    packages: Vec<(String, String, bool, String, Option<String>, i64)>, // includes install_args + step
                 }
 
                 #[derive(serde::Serialize)]
@@ -2340,7 +3386,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     name: String,
                     version: String,
                     python_version: String,
-                    packages: Vec<(String, String, bool, String, Option<String>)>, // includes install_args
+                    packages: Vec<(String, String, bool, String, Option<String>, i64)>, // includes install_args + step
                 }
 
                 let content = std::fs::read_to_string(file)?;
@@ -2351,8 +3397,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 for t in registry.templates {
-                    let t_id = db.create_template(&t.name, &t.version, &t.python_version)?;
-                    for (p_name, p_ver, is_pinned, install_type, install_args) in t.packages {
+                    let (t_id, _) = db.create_template(&t.name, &t.version, &t.python_version)?;
+                    for (p_name, p_ver, is_pinned, install_type, install_args, step) in t.packages {
                         db.add_template_package(
                             t_id,
                             &p_name,
@@ -2360,6 +3406,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             is_pinned,
                             &install_type,
                             install_args.as_deref(),
+                            step,
                         )?;
                     }
                 }
@@ -3055,6 +4102,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     current = parent.to_path_buf();
                 }
 
+                // Inject recently created env (within 10 min) as a low-priority candidate.
+                // It will be deduped if it's already a project-linked candidate.
+                if let Some((recent_name, recent_path)) = db.get_most_recent_env(10)?
+                    && std::path::Path::new(&recent_path).exists()
+                {
+                    all_candidates.push((
+                        recent_name,
+                        recent_path,
+                        "(recently created)".to_string(),
+                        0, // low activation count → sorted last
+                        "recent".to_string(),
+                    ));
+                }
+
                 // Deduplicate by env name (keep first occurrence = highest priority)
                 let mut seen = std::collections::HashSet::new();
                 let candidates: Vec<_> = all_candidates
@@ -3083,20 +4144,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     1 => {
                         // Auto-select single candidate
-                        let (env_name, env_path, project_path, count, _) = &valid[0];
+                        let (env_name, env_path, project_path, count, link_type) = &valid[0];
                         let rel = project_path.clone();
                         let _ = db.record_activation(&cwd, env_name);
                         if path_only {
-                            eprintln!(
-                                "✓ Auto-selecting: {} ({}{})",
-                                env_name.cyan(),
-                                rel.dimmed(),
-                                if *count >= 10 {
-                                    " ·frequent".to_string()
-                                } else {
-                                    String::new()
-                                }
-                            );
+                            if link_type == "recent" {
+                                eprintln!("✓ Activating recently created: {}", env_name.cyan(),);
+                            } else {
+                                eprintln!(
+                                    "✓ Auto-selecting: {} ({}{})",
+                                    env_name.cyan(),
+                                    rel.dimmed(),
+                                    if *count >= 10 {
+                                        " ·frequent".to_string()
+                                    } else {
+                                        String::new()
+                                    }
+                                );
+                            }
                             println!("{}", env_path);
                         } else {
                             eprintln!("✓ Auto-selecting: {} ({})", env_name.cyan(), rel.dimmed());
@@ -3114,7 +4179,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 String::new()
                             };
-                            let type_marker = if link_type == "user" { " ★" } else { "" };
+                            let type_marker = match link_type.as_str() {
+                                "user" => " ★",
+                                "recent" => " 🕐",
+                                _ => "",
+                            };
                             eprintln!(
                                 "  {}: {}{} ({}{})",
                                 (i + 1).to_string().bold(),

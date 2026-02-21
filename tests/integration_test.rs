@@ -170,7 +170,7 @@ fn test_template_creation_and_packages() {
     let db = zen::db::Database::open(Some(&db_path)).unwrap();
 
     // Create template
-    let template_id = db.create_template("ml-base", "1.0", "3.12").unwrap();
+    let (template_id, _created) = db.create_template("ml-base", "1.0", "3.12").unwrap();
     assert!(template_id > 0);
 
     // List templates
@@ -180,7 +180,7 @@ fn test_template_creation_and_packages() {
 
     // Get template ID by name
     let found_id = db.get_template_id("ml-base", "1.0").unwrap();
-    assert_eq!(found_id, Some(template_id));
+    assert_eq!(found_id, Some(template_id)); // template_id is already i64
 
     // Cleanup
     fs::remove_file(db_path).ok();
@@ -303,7 +303,7 @@ fn test_session_management() {
     let db = zen::db::Database::open(Some(&db_path)).unwrap();
 
     // Create template
-    let template_id = db.create_template("session-tpl", "1.0", "3.12").unwrap();
+    let (template_id, _created) = db.create_template("session-tpl", "1.0", "3.12").unwrap();
 
     // No active session initially
     let session = db.get_active_session().unwrap();
@@ -315,9 +315,10 @@ fn test_session_management() {
     // Check active session
     let session = db.get_active_session().unwrap();
     assert!(session.is_some());
-    let (tpl_id, path) = session.unwrap();
+    let (tpl_id, path, pid) = session.unwrap();
     assert_eq!(tpl_id, template_id);
     assert_eq!(path, "/tmp/session-env");
+    assert!(pid.is_some()); // PID should be stored
 
     // Clear sessions
     db.clear_sessions().unwrap();

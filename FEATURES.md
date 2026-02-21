@@ -83,8 +83,8 @@
 | 63 | Stable CLI interface guarantee | gate | 🔴 | 🟢 | low | 📋 | 1.0.0 | — | — | SemVer commitment |
 | 64 | Stable MCP interface | gate | 🔴 | 🟢 | low | 📋 | 1.0.0 | — | — | |
 | 65 | Stable DB schema + migrations | gate | 🔴 | 🟡 | mid | 📋 | 1.0.0 | — | — | |
-| 66 | Prebuilt binaries (x86 + arm) | release | 🟠 | 🟢 | mid | 📋 | 1.0.0 | — | — | GitHub Releases |
-| 67 | Install script (`curl \| sh`) | release | 🟡 | 🟢 | low | 💡 | — | — | — | |
+| 66 | Prebuilt binaries (x86 + arm + musl) | release | 🟠 | 🟢 | mid | ✅ | 1.0.0 | 0.6.10 | — | GitHub Releases — 4 targets: x86_64-gnu, x86_64-musl, aarch64-gnu, aarch64-musl |
+| 67 | Install script (`curl \| sh`) | release | 🟡 | 🟢 | low | ✅ | — | 0.6.10 | — | Smart glibc detection → musl fallback |
 | 68 | `zen remote` — SSH env management | ⚪ | 🔴 | hardcore | 💡 | — | — | — | |
 | 69 | `zen bench <env>` — benchmarks | ⚪ | 🟢 | high | 💡 | — | — | — | torch/numpy perf |
 | 70 | `zen audit <env>` — vuln scanning | ⚪ | 🟢 | mid | 💡 | — | — | — | pip-audit |
@@ -145,6 +145,27 @@
 | 125 | Windows: PowerShell/CMD hooks | portability | 🟠 | 🟡 | high | 📋 | 0.9.0 | — | — | Shell hooks currently bash/fish only |
 | 126 | Windows: config dir via `dirs` crate | portability | 🟠 | 🟢 | mid | 📋 | 0.9.0 | — | — | `~/.config/zen` → `%APPDATA%\zen` |
 | 127 | Windows: conditional file permissions | portability | 🟡 | 🟢 | low | 📋 | 0.9.0 | — | — | `#[cfg(unix)]` guards already partial |
+| 128 | `zen add` — track existing env | core | 🟠 | 🟢 | low | ✅ | 0.6.10 | 0.6.10 | — | Accepts venv root, bin/python, or bin/activate |
+| 129 | `zen rm --cached` — untrack env | core | 🟠 | 🟢 | low | ✅ | 0.6.10 | 0.6.10 | — | Remove from DB only, keep files on disk |
+| 130 | `zen ls` alias | cli | 🟢 | 🟢 | low | ✅ | 0.6.10 | 0.6.10 | — | Alias for `zen list` |
+| 131 | `zen list -1` single-column output | output | 🟢 | 🟢 | low | ✅ | 0.6.10 | 0.6.10 | — | Names only, one per line |
+| 132 | `zen list -l` long format | output | 🟢 | 🟢 | low | ✅ | 0.6.10 | 0.6.10 | — | Force wide layout |
+| 133 | MCP `track_environment` | mcp | 🟠 | 🟢 | low | ✅ | 0.6.10 | 0.6.10 | `add_environment` | Register existing venv by path |
+| 134 | MCP `untrack_environment` | mcp | 🟠 | 🟢 | low | ✅ | 0.6.10 | 0.6.10 | — | Remove from registry, keep files |
+| 135 | MCP `run_in_environment` cwd support | mcp | 🟡 | 🟢 | low | ✅ | 0.6.10 | 0.6.10 | — | Optional working directory param |
+| 136 | Activity log (`zen log`) | core | 🟠 | 🟡 | mid | ✅ | 0.6.10 | 0.6.10 | — | Tracks create/remove/install/uninstall events |
+| 137 | Rustls-only TLS (OpenSSL dropped) | infra | 🟠 | 🟡 | low | ✅ | 0.6.10 | 0.6.10 | native-tls | Enables musl static builds; `reqwest` default-features=false |
+| 138 | Musl static builds in CI | release | 🟠 | 🟢 | mid | ✅ | 0.6.10 | 0.6.10 | — | Jetson (glibc 2.35) + Raspi (glibc 2.36) support |
+| 139 | Smart installer glibc detection | release | 🟠 | 🟢 | mid | ✅ | 0.6.10 | 0.6.10 | — | Auto-selects musl binary if glibc < 2.39 |
+| 140 | `zen template create/edit` interactive REPL | core | 🟠 | 🟡 | high | ✅ | 0.7.0 | 0.6.12 | — | Step-by-step builder with live summary, `--step N`, subcommand help |
+| 141 | `zen template export/import` (TOML) | data | 🟡 | 🟢 | mid | ✅ | 0.7.0 | 0.6.12 | — | Portable TOML format for template sharing |
+| 142 | `zen template list` filters | cli | 🟡 | 🟢 | low | ✅ | 0.7.0 | 0.6.12 | — | `--name`, `--python`, `--has-pkg` filter flags |
+| 143 | `zen rename <old> <new>` | core | 🟠 | 🟢 | low | ✅ | 0.7.0 | 0.6.12 | — | Rename environment in DB; validates uniqueness |
+| 144 | Smart name suggestion in `zen add` | ux | 🟡 | 🟢 | mid | ✅ | 0.7.0 | 0.6.12 | — | Path-walking heuristic for generic venv names (`.venv` → `project-name`) |
+| 145 | MCP `rename_environment` | mcp | 🟡 | 🟢 | low | ✅ | 0.7.0 | 0.6.12 | — | Remote rename via MCP; validates existence + uniqueness |
+| 146 | PID-based stale session auto-recovery | safety | 🔴 | 🟡 | mid | ✅ | 0.6.12 | 0.6.12 | — | `active_sessions` stores PID; `clear_stale_session()` checks `/proc/<pid>` liveness — dead sessions auto-clear instead of blocking |
+| 147 | Comma separator for multi-template `--from` | ux | 🟡 | 🟢 | low | ✅ | 0.6.12 | 0.6.12 | — | `--from a,b` works without quoting (pipe `\|` still supported); dedup prevents double-apply |
+| 148 | MCP API consolidation (27 → 10 tools) | mcp | 🔴 | 🔴 | high | 📋 | 0.7.0 | — | — | Action-dispatch pattern: `manage_environment`, `inspect_environment`, `manage_packages`, `find_package`, `manage_project`, `manage_labels`. Breaking change for MCP clients. See implementation plan. |
 
 ---
 

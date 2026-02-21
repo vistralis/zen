@@ -1,6 +1,6 @@
 [package]
 name = "zen"
-version = "0.6.10"
+version = "0.6.12"
 edition = "2024"
 license = "Apache-2.0"
 description = "Peace of mind for Python environments"
@@ -34,6 +34,7 @@ rmcp = { version = "0.14", features = ["server", "transport-io"] }
 schemars = "0.8"
 terminal_size = "0.4"
 ctrlc = "3.4"
+rustyline = "17.0.2"
 
 [dev-dependencies]
 tempfile = "3.24.0"

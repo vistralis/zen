@@ -168,6 +168,26 @@ pub fn normalize_package_name(name: &str) -> String {
     name.to_lowercase().replace('-', "_")
 }
 
+/// Extract pip package name from a wheel filename or path.
+///
+/// PEP 427 format: `{distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl`
+/// Example: `/localdisk/.../bitsandbytes-0.49.2.dev0-cp312-cp312-linux_aarch64.whl`
+/// Returns: `bitsandbytes`
+///
+/// Normalizes underscores to hyphens (pip convention) and lowercases.
+pub fn normalize_wheel_name(path: &str) -> Option<String> {
+    let filename = std::path::Path::new(path).file_name()?.to_str()?;
+    if !filename.ends_with(".whl") {
+        return None;
+    }
+    // Distribution name is everything before the first '-' followed by a version
+    let name_part = filename.split('-').next()?;
+    if name_part.is_empty() {
+        return None;
+    }
+    Some(name_part.to_lowercase().replace('_', "-"))
+}
+
 // =============================================================================
 // NATIVE DEPENDENCY CHECKER (learned from pip & uv)
 // =============================================================================
@@ -777,10 +797,11 @@ pub struct TemplatePart {
     pub version: String,
 }
 
-/// Parses a template string (`name:version|name:version`).
+/// Parses a template string (`name:version,name:version` or `name:version|name:version`).
+/// Both `,` and `|` are accepted as separators for ergonomics (comma avoids shell quoting).
 pub fn parse_template_string(template_str: &str) -> Vec<TemplatePart> {
     template_str
-        .split('|')
+        .split([',', '|'])
         .map(|part| {
             let mut subparts = part.splitn(2, ':');
             let name = subparts.next().unwrap_or_default().to_string();
@@ -857,4 +878,125 @@ pub fn discover_venvs(base_path: &Path) -> Vec<PathBuf> {
 
     scan_recursive(base_path, 0, &mut venvs);
     venvs
+}
+
+// =============================================================================
+// SMART NAME SUGGESTION
+// =============================================================================
+
+/// Names that are generic virtual-environment directory names.
+/// When `zen add` encounters one of these, it should suggest a better name.
+const GENERIC_VENV_NAMES: &[&str] = &["venv", ".venv", "env", ".env", "virtualenv", ".virtualenv"];
+
+/// Umbrella/root-level directory names that are not meaningful for naming.
+/// Walking stops when we hit one of these.
+const UMBRELLA_DIRS: &[&str] = &[
+    "localdisk",
+    "sharedisk",
+    "workspace",
+    "workdir",
+    "workspaces",
+    "home",
+    "tmp",
+    "opt",
+    "usr",
+    "var",
+    "srv",
+    "mnt",
+    "media",
+    "projects",
+    "repos",
+    "repositories",
+    "git",
+    "code",
+    "dev",
+    "root",
+    "Users",
+    "volumes",
+];
+
+/// Narrow suffixes that provide context but alone aren't descriptive enough.
+/// Include them but keep walking to find a meaningful parent.
+const NARROW_SUFFIXES: &[&str] = &[
+    "cli", "tool", "tools", "api", "lib", "libs", "src", "bin", "app", "pkg", "core", "server",
+    "client", "sdk", "utils", "scripts", "service", "services", "backend", "frontend", "internal",
+    "external", "common", "shared", "base",
+];
+
+/// Returns true if the given directory name is a generic venv name.
+pub fn is_generic_venv_name(name: &str) -> bool {
+    GENERIC_VENV_NAMES
+        .iter()
+        .any(|g| g.eq_ignore_ascii_case(name))
+}
+
+/// Suggest a meaningful environment name from a venv path by walking up
+/// the directory tree and combining meaningful components.
+///
+/// # Examples
+/// ```text
+/// /sharedisk/huggingface/cli/venv   → Some("huggingface-cli")
+/// /localdisk/projects/myproject/.venv → Some("myproject")
+/// /home/user/some-project/env       → Some("some-project")
+/// /opt/ml-tools/inference/api/.venv  → Some("inference-api")
+/// ```
+///
+/// Returns `None` if no meaningful name can be derived (e.g. `/tmp/venv`).
+pub fn suggest_env_name(venv_path: &Path) -> Option<String> {
+    let mut components: Vec<String> = Vec::new();
+    let mut current = venv_path;
+
+    // Skip the venv dir itself if it's generic
+    if let Some(name) = current.file_name().and_then(|n| n.to_str())
+        && !is_generic_venv_name(name)
+    {
+        // Not a generic name — no suggestion needed
+        return None;
+    }
+
+    // Walk up the path
+    while let Some(parent) = current.parent() {
+        let name = match parent.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => break, // hit root
+        };
+
+        let lower = name.to_lowercase();
+
+        // Hit an umbrella dir — stop
+        if UMBRELLA_DIRS.iter().any(|u| u.eq_ignore_ascii_case(&lower)) {
+            break;
+        }
+
+        // Skip generic venv names (shouldn't happen but be safe)
+        if is_generic_venv_name(&lower) {
+            current = parent;
+            continue;
+        }
+
+        if NARROW_SUFFIXES
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(&lower))
+        {
+            // Narrow suffix — include and keep walking
+            components.push(name.to_string());
+            current = parent;
+            continue;
+        }
+
+        // Meaningful component — include and stop
+        components.push(name.to_string());
+        break;
+    }
+
+    if components.is_empty() {
+        return None;
+    }
+
+    // Components are collected child-to-parent, reverse for parent-first
+    components.reverse();
+
+    // Join with hyphen, lowercase
+    let suggested = components.join("-").to_lowercase();
+    Some(suggested)
 }

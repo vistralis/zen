@@ -152,6 +152,8 @@ Zen ships a built-in [MCP server](docs/mcp.md) so AI coding assistants can manag
 | `zen link add/rm/list` | Project–environment links |
 | `zen label add/rm/list` | Organize with labels |
 | `zen note add/list/rm` | Attach notes |
+| `zen rename <old> <new>` | Rename an environment |
+| `zen template` | Create, edit, inspect, export/import templates |
 | `zen mcp` | Start the MCP server |
 
 Full reference → [docs/commands.md](docs/commands.md)

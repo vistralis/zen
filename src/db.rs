@@ -143,6 +143,12 @@ impl Database {
             [],
         );
 
+        // v0.7.0: Add step column for layer tracking (Docker-style)
+        let _ = conn.execute(
+            "ALTER TABLE template_packages ADD COLUMN step INTEGER DEFAULT 0",
+            [],
+        );
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS templates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,11 +220,15 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 template_id INTEGER,
                 env_path TEXT NOT NULL,
+                pid INTEGER,
                 start_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(template_id) REFERENCES templates(id) ON DELETE CASCADE
             )",
             [],
         )?;
+        // Additive migration: add pid column if missing (upgraded from older schema)
+        conn.execute_batch("ALTER TABLE active_sessions ADD COLUMN pid INTEGER")
+            .ok(); // silently ignore if column already exists
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS config (
@@ -417,6 +427,16 @@ impl Database {
         Ok(name)
     }
 
+    /// Rename an environment. Returns true if the rename was performed.
+    pub fn rename_environment(&self, old_name: &str, new_name: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE environments SET name = ?1, updated_at = CURRENT_TIMESTAMP WHERE name = ?2",
+            params![new_name, old_name],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Lists all environments with basic info (name, path, python_version, updated_at, is_favorite).
     pub fn list_envs(
         &self,
@@ -450,18 +470,42 @@ impl Database {
         Ok(results)
     }
 
-    /// Creates a new template or updates an existing one.
-    pub fn create_template(&self, name: &str, version: &str, python_version: &str) -> Result<i64> {
+    /// Creates a new template or returns the existing one.
+    /// Returns (template_id, is_new).
+    pub fn create_template(
+        &self,
+        name: &str,
+        version: &str,
+        python_version: &str,
+    ) -> Result<(i64, bool)> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO templates (name, version, python_version, updated_at)
-             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
-            params![name, version, python_version],
-        )?;
-        Ok(conn.last_insert_rowid())
+        // Check if template already exists
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM templates WHERE name = ?1 AND version = ?2",
+                params![name, version],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            // Update timestamp only
+            conn.execute(
+                "UPDATE templates SET python_version = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                params![python_version, id],
+            )?;
+            Ok((id, false))
+        } else {
+            conn.execute(
+                "INSERT INTO templates (name, version, python_version, updated_at)
+                 VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
+                params![name, version, python_version],
+            )?;
+            Ok((conn.last_insert_rowid(), true))
+        }
     }
 
     /// Adds a package to a template definition.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_template_package(
         &self,
         template_id: i64,
@@ -470,36 +514,70 @@ impl Database {
         is_pinned: bool,
         install_type: &str,
         install_args: Option<&str>,
+        step: i64,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let pinned = if is_pinned { 1 } else { 0 };
         conn.execute(
-            "INSERT OR REPLACE INTO template_packages (template_id, package_name, version, is_pinned, install_type, install_args)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![template_id, name, version, pinned, install_type, install_args],
+            "INSERT OR REPLACE INTO template_packages (template_id, package_name, version, is_pinned, install_type, install_args, step)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![template_id, name, version, pinned, install_type, install_args, step],
         )?;
         Ok(())
     }
 
-    /// Starts a template recording session.
+    /// Returns the next step number for a template (max step + 1).
+    pub fn get_next_step(&self, template_id: i64) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let max: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(step), 0) FROM template_packages WHERE template_id = ?1",
+            params![template_id],
+            |row| row.get(0),
+        )?;
+        Ok(max + 1)
+    }
+
+    /// Starts a template recording session, storing the current PID for liveness detection.
     pub fn start_session(&self, template_id: i64, env_path: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let pid = std::process::id() as i64;
         conn.execute(
-            "INSERT INTO active_sessions (template_id, env_path) VALUES (?1, ?2)",
-            params![template_id, env_path],
+            "INSERT INTO active_sessions (template_id, env_path, pid) VALUES (?1, ?2, ?3)",
+            params![template_id, env_path, pid],
         )?;
         Ok(())
     }
 
     /// Gets the currently active recording session, if any.
-    pub fn get_active_session(&self) -> Result<Option<(i64, String)>> {
+    /// Returns (template_id, env_path, pid).
+    pub fn get_active_session(&self) -> Result<Option<(i64, String, Option<i64>)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT template_id, env_path FROM active_sessions LIMIT 1")?;
+        let mut stmt =
+            conn.prepare("SELECT template_id, env_path, pid FROM active_sessions LIMIT 1")?;
         let mut rows = stmt.query([])?;
         if let Some(row) = rows.next()? {
-            Ok(Some((row.get(0)?, row.get(1)?)))
+            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Checks if the process that owns the active session is still alive.
+    /// Returns true if there is no session, or the owning process is dead (i.e., safe to proceed).
+    pub fn clear_stale_session(&self) -> Result<bool> {
+        if let Some((_, _, pid)) = self.get_active_session()? {
+            let is_alive = pid.is_some_and(|p| {
+                // Check /proc/<pid> existence — works on Linux without extra deps
+                std::path::Path::new(&format!("/proc/{}", p)).exists()
+            });
+            if is_alive {
+                return Ok(false); // session owner is still running
+            }
+            // Stale session — auto-clear it
+            self.clear_sessions()?;
+            Ok(true)
+        } else {
+            Ok(true) // no session at all
         }
     }
 
@@ -522,13 +600,14 @@ impl Database {
         }
     }
 
-    /// Returns all packages defined in a template.
+    /// Returns all packages defined in a template, ordered by step and insertion order.
+    /// Returns: (package_name, version, is_pinned, install_type, install_args, step)
     pub fn get_template_packages(
         &self,
         template_id: i64,
-    ) -> Result<Vec<(String, String, bool, String, Option<String>)>> {
+    ) -> Result<Vec<(String, String, bool, String, Option<String>, i64)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT package_name, version, is_pinned, install_type, install_args FROM template_packages WHERE template_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT package_name, version, is_pinned, install_type, install_args, COALESCE(step, 0) FROM template_packages WHERE template_id = ?1 ORDER BY step, id")?;
         let rows = stmt.query_map(params![template_id], |row| {
             let is_pinned: i32 = row.get(2)?;
             Ok((
@@ -537,6 +616,7 @@ impl Database {
                 is_pinned == 1,
                 row.get(3)?,
                 row.get(4)?,
+                row.get(5)?,
             ))
         })?;
         let mut results = Vec::new();
@@ -581,6 +661,50 @@ impl Database {
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    /// Deletes a template by its database ID (packages + template row).
+    pub fn delete_template_by_id(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM template_packages WHERE template_id = ?1",
+            params![id],
+        )?;
+        conn.execute("DELETE FROM templates WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Removes a single package from a template by name.
+    pub fn remove_template_package(&self, template_id: i64, package_name: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM template_packages WHERE template_id = ?1 AND LOWER(package_name) = LOWER(?2)",
+            params![template_id, package_name],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Removes all packages in a given step from a template. Returns count removed.
+    pub fn remove_template_step(&self, template_id: i64, step: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM template_packages WHERE template_id = ?1 AND step = ?2",
+            params![template_id, step],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Gets template metadata (name, version, python_version) by template ID.
+    pub fn get_template_by_id(&self, template_id: i64) -> Result<Option<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT name, version, python_version FROM templates WHERE id = ?1")?;
+        let mut rows = stmt.query(params![template_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+        } else {
+            Ok(None)
         }
     }
 
@@ -797,6 +921,25 @@ impl Database {
                  ORDER BY pe.last_activated_at DESC
                  LIMIT 1",
                 [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Returns the most recently created environment within `minutes` minutes.
+    ///
+    /// Used as a fallback by `zen activate` (no args) to offer quick activation
+    /// of just-created environments.
+    pub fn get_most_recent_env(&self, minutes: i64) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn
+            .query_row(
+                "SELECT name, path FROM environments
+                 WHERE created_at >= datetime('now', ?1)
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                params![format!("-{} minutes", minutes)],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
@@ -1047,7 +1190,7 @@ impl Database {
             String,
             String,
             String,
-            Vec<(String, String, bool, String, Option<String>)>,
+            Vec<(String, String, bool, String, Option<String>, i64)>,
         )>,
     > {
         let (templates, _packages_map) = {

@@ -19,6 +19,7 @@ use uuid::Uuid;
 pub struct ZenOps<'a> {
     db: &'a Database,
     home: PathBuf,
+    colored: bool,
 }
 
 /// Options for package installation (shared by CLI and MCP).
@@ -33,9 +34,31 @@ pub struct InstallOptions {
 }
 
 impl<'a> ZenOps<'a> {
-    /// Creates a new operational layer instance.
+    /// Creates a new operational layer instance (colored output for CLI).
     pub fn new(db: &'a Database, home: PathBuf) -> Self {
-        Self { db, home }
+        Self {
+            db,
+            home,
+            colored: true,
+        }
+    }
+
+    /// Creates an instance with plain output (no ANSI colors), for MCP.
+    pub fn new_plain(db: &'a Database, home: PathBuf) -> Self {
+        Self {
+            db,
+            home,
+            colored: false,
+        }
+    }
+
+    /// Returns a colored or plain success marker.
+    fn ok_mark(&self) -> String {
+        if self.colored {
+            "✓".green().to_string()
+        } else {
+            "✓".to_string()
+        }
     }
 
     /// Lists all environments from the database
@@ -67,7 +90,7 @@ impl<'a> ZenOps<'a> {
             self.db.delete_env(name)?;
             Ok(format!(
                 "{} Environment '{}' removed from disk and registry.",
-                "✓".green(),
+                self.ok_mark(),
                 name
             ))
         } else {
@@ -77,7 +100,7 @@ impl<'a> ZenOps<'a> {
                 std::fs::remove_dir_all(&orphan_path)?;
                 Ok(format!(
                     "{} Orphaned directory '{}' removed from disk (was not in registry).",
-                    "✓".green(),
+                    self.ok_mark(),
                     name
                 ))
             } else {
@@ -91,7 +114,7 @@ impl<'a> ZenOps<'a> {
         self.db.delete_env(name)?;
         Ok(format!(
             "{} Environment '{}' removed from registry (files kept on disk).",
-            "✓".green(),
+            self.ok_mark(),
             name
         ))
     }
@@ -380,18 +403,24 @@ impl<'a> ZenOps<'a> {
             .add_comment(&uuid, &project_path, env_id, message, Some(&tag))?;
 
         let msg = if let Some(name) = env_name {
-            format!(
-                "{} comment logged to {} history (UUID: {}).",
-                "✓".green(),
-                name.bold().cyan(),
-                uuid.dimmed()
-            )
-        } else {
+            if self.colored {
+                format!(
+                    "{} comment logged to {} history (UUID: {}).",
+                    "✓".green(),
+                    name.bold().cyan(),
+                    uuid.dimmed()
+                )
+            } else {
+                format!("✓ comment logged to {} history (UUID: {}).", name, uuid)
+            }
+        } else if self.colored {
             format!(
                 "{} comment logged to project history (UUID: {}).",
                 "✓".green(),
                 uuid.dimmed()
             )
+        } else {
+            format!("✓ comment logged to project history (UUID: {}).", uuid)
         };
         Ok(msg)
     }
@@ -586,7 +615,7 @@ impl<'a> ZenOps<'a> {
 
         Ok(format!(
             "\n{} Imported {} environment{}, skipped {}.",
-            "✓".green(),
+            self.ok_mark(),
             imported,
             if imported == 1 { "" } else { "s" },
             skipped
