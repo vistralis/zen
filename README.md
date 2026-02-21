@@ -59,10 +59,11 @@ $ zen deactivate          # alias: zd
 Install packages — Zen delegates to uv, so it's fast:
 
 ```bash
-$ zen install ml_env numpy scipy opencv-python
+$ zen install numpy scipy opencv-python         # into active env
+$ zen install -n ml_env numpy scipy              # into specific env
 
 # Need a specific CUDA build? Just pass the index:
-$ zen install ml_env torch torchvision \
+$ zen install torch torchvision \
     --index-url https://download.pytorch.org/whl/cu130
 ```
 
@@ -142,8 +143,8 @@ Zen ships a built-in [MCP server](docs/mcp.md) so AI coding assistants can manag
 | `zen deactivate` | Deactivate |
 | `zen list` / `zen ls` | List all environments (`-1` names only, `-l` long) |
 | `zen info <name>` | Detailed environment view |
-| `zen install [env] <pkgs>` | Install packages |
-| `zen uninstall [env] <pkgs>` | Remove packages |
+| `zen install [-n env] <pkgs>` | Install packages |
+| `zen uninstall [-n env] <pkgs>` | Remove packages |
 | `zen run <env> <cmd>` | Run a command without activating |
 | `zen find <pkg>` | Find a package across all environments |
 | `zen inspect <env> <pkg>` | Detailed package info |

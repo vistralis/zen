@@ -166,6 +166,7 @@
 | 146 | PID-based stale session auto-recovery | safety | 🔴 | 🟡 | mid | ✅ | 0.6.12 | 0.6.12 | — | `active_sessions` stores PID; `clear_stale_session()` checks `/proc/<pid>` liveness — dead sessions auto-clear instead of blocking |
 | 147 | Comma separator for multi-template `--from` | ux | 🟡 | 🟢 | low | ✅ | 0.6.12 | 0.6.12 | — | `--from a,b` works without quoting (pipe `\|` still supported); dedup prevents double-apply |
 | 148 | MCP API consolidation (27 → 10 tools) | mcp | 🔴 | 🔴 | high | 📋 | 0.7.0 | — | — | Action-dispatch pattern: `manage_environment`, `inspect_environment`, `manage_packages`, `find_package`, `manage_project`, `manage_labels`. Breaking change for MCP clients. See implementation plan. |
+| 149 | PEP 440 version comparator (`pep440_rs`) | health | 🟠 | 🟢 | low | 📋 | 0.7.0 | — | `compare_versions` | Replace handrolled version comparison with `astral-sh/pep440_rs`. Fixes false-positive conflicts for post/dev/pre-release versions (e.g. `0.1.8.post2 != 0.1.8`). |
 
 ---
 

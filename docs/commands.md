@@ -32,6 +32,13 @@ zen rm myproject --yes    # Skip confirmation
 zen rm myproject --cached # Remove from database only, keep files on disk
 ```
 
+### `zen rename <old> <new>`
+Rename an environment.
+
+```bash
+zen rename old-name new-name
+```
+
 ### `zen activate [name]`
 Activate an environment in the current shell (requires [shell hook](installation.md#shell-integration)).
 
@@ -54,23 +61,23 @@ zd                        # Shortcut
 
 Zen delegates all package operations to [uv](https://github.com/astral-sh/uv) for speed.
 
-### `zen install [name] <packages>`
+### `zen install [-n env] <packages>`
 Install packages into an environment.
 
 ```bash
 zen install numpy pandas                     # Into active environment
-zen install myproject numpy pandas           # Into specific environment
+zen install -n myproject numpy pandas        # Into specific environment
 zen install torch --index-url https://...    # Custom index (CUDA builds)
 zen install ./my_package.whl                 # Local wheel
 zen install --dry-run numpy                  # Preview without installing
 ```
 
-### `zen uninstall [name] <packages>`
+### `zen uninstall [-n env] <packages>`
 Remove packages from an environment.
 
 ```bash
-zen uninstall numpy pandas
-zen uninstall myproject numpy
+zen uninstall numpy pandas                   # From active environment
+zen uninstall -n myproject numpy             # From specific environment
 ```
 
 ### `zen run <name> <command>`

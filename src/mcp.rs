@@ -216,7 +216,8 @@ impl ZenMcpServer {
     )]
     fn list_environments(&self, Parameters(params): Parameters<ListEnvironmentsParams>) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.list_envs() {
             Ok(envs) => {
@@ -256,7 +257,8 @@ impl ZenMcpServer {
         Parameters(params): Parameters<CreateEnvironmentParams>,
     ) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.create_env(&params.name, params.python) {
             Ok(msg) => msg,
@@ -269,7 +271,8 @@ impl ZenMcpServer {
     )]
     fn install_packages(&self, Parameters(params): Parameters<InstallPackagesParams>) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         let opts = crate::ops::InstallOptions {
             index_url: params.index_url,
@@ -299,7 +302,8 @@ impl ZenMcpServer {
         Parameters(params): Parameters<UninstallPackagesParams>,
     ) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.uninstall_packages(&params.env_name, params.packages.clone()) {
             Ok(msg) => {
@@ -317,7 +321,8 @@ impl ZenMcpServer {
     #[tool(description = "Remove an environment from the database and delete it from disk")]
     fn remove_environment(&self, Parameters(params): Parameters<EnvNameParam>) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match crate::types::EnvName::new(params.env_name.to_string()) {
             Ok(name) => match ops.remove_env(&name) {
@@ -453,7 +458,8 @@ impl ZenMcpServer {
     )]
     fn untrack_environment(&self, Parameters(params): Parameters<EnvNameParam>) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match crate::types::EnvName::new(params.env_name.to_string()) {
             Ok(name) => match ops.untrack_env(&name) {
@@ -598,7 +604,8 @@ impl ZenMcpServer {
     #[tool(description = "Link an environment to a project directory for context-aware activation")]
     fn associate_project(&self, Parameters(params): Parameters<AssociateProjectParams>) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.associate_project(
             &params.project_path,
@@ -614,7 +621,8 @@ impl ZenMcpServer {
     #[tool(description = "Get the default environment for a project")]
     fn get_default_environment(&self, Parameters(params): Parameters<ProjectPathParam>) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.get_default_env(&params.project_path) {
             Ok(Some(env)) => format!("Default environment: {}", env),
@@ -626,7 +634,8 @@ impl ZenMcpServer {
     #[tool(description = "Get all environments associated with a project")]
     fn get_project_environments(&self, Parameters(params): Parameters<ProjectPathParam>) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.get_project_envs(&params.project_path) {
             Ok(envs) => {
@@ -653,7 +662,8 @@ impl ZenMcpServer {
     )]
     fn get_environment_details(&self, Parameters(params): Parameters<EnvNameParam>) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.list_envs() {
             Ok(envs) => {
@@ -706,7 +716,8 @@ impl ZenMcpServer {
     #[tool(description = "Check environment health: package conflicts, outdated dependencies")]
     fn get_environment_health(&self, Parameters(params): Parameters<EnvNameParam>) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.check_health(&params.env_name) {
             Ok(report) => report.to_text(&params.env_name),
@@ -720,7 +731,8 @@ impl ZenMcpServer {
         Parameters(params): Parameters<CompareEnvironmentsParams>,
     ) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         if params.env_names.len() < 2 {
             return "At least two environment names are required".to_string();
@@ -826,7 +838,8 @@ impl ZenMcpServer {
     #[tool(description = "Get notes attached to an environment (purpose, description, reminders)")]
     fn get_environment_notes(&self, Parameters(params): Parameters<EnvNameParam>) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.list_comments(None, Some(&params.env_name)) {
             Ok(comments) => {
@@ -849,7 +862,8 @@ impl ZenMcpServer {
         Parameters(params): Parameters<AddEnvironmentNoteParams>,
     ) -> String {
         let db = self.db.lock().unwrap();
-        let ops = crate::ops::ZenOps::new_plain(&db, self.home.clone());
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.add_env_note(&params.env_name, &params.note) {
             Ok(msg) => msg,

@@ -29,10 +29,12 @@ The server communicates over stdio using JSON-RPC. Configure your editor or agen
 
 | Tool | Description |
 |------|-------------|
+| `get_version()` | Get the running Zen server version |
 | `create_environment(name, python?)` | Create a new environment |
 | `track_environment(path, name?)` | Register an existing virtual environment by path |
 | `remove_environment(env_name)` | Remove an environment (database + disk) |
 | `untrack_environment(env_name)` | Remove from database only, keep files on disk |
+| `rename_environment(old_name, new_name)` | Rename an environment |
 | `list_environments(label?)` | List all environments (optional label filter) |
 | `get_environment_details(env_name)` | Full details: Python version, packages, labels, notes |
 | `get_environment_health(env_name)` | Health check: Python binary, CUDA, dependencies |

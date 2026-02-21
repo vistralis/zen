@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::context::OutputMode;
 use crate::db::Database;
 use crate::types::{Diagnostic, EnvName, HealthDiagnostic, HealthLevel, HealthReport};
 use crate::utils;
@@ -19,7 +20,7 @@ use uuid::Uuid;
 pub struct ZenOps<'a> {
     db: &'a Database,
     home: PathBuf,
-    colored: bool,
+    mode: OutputMode,
 }
 
 /// Options for package installation (shared by CLI and MCP).
@@ -34,31 +35,9 @@ pub struct InstallOptions {
 }
 
 impl<'a> ZenOps<'a> {
-    /// Creates a new operational layer instance (colored output for CLI).
-    pub fn new(db: &'a Database, home: PathBuf) -> Self {
-        Self {
-            db,
-            home,
-            colored: true,
-        }
-    }
-
-    /// Creates an instance with plain output (no ANSI colors), for MCP.
-    pub fn new_plain(db: &'a Database, home: PathBuf) -> Self {
-        Self {
-            db,
-            home,
-            colored: false,
-        }
-    }
-
-    /// Returns a colored or plain success marker.
-    fn ok_mark(&self) -> String {
-        if self.colored {
-            "✓".green().to_string()
-        } else {
-            "✓".to_string()
-        }
+    /// Creates a new operational layer instance.
+    pub fn new(db: &'a Database, home: PathBuf, mode: OutputMode) -> Self {
+        Self { db, home, mode }
     }
 
     /// Lists all environments from the database
@@ -90,7 +69,7 @@ impl<'a> ZenOps<'a> {
             self.db.delete_env(name)?;
             Ok(format!(
                 "{} Environment '{}' removed from disk and registry.",
-                self.ok_mark(),
+                self.mode.ok_mark(),
                 name
             ))
         } else {
@@ -100,7 +79,7 @@ impl<'a> ZenOps<'a> {
                 std::fs::remove_dir_all(&orphan_path)?;
                 Ok(format!(
                     "{} Orphaned directory '{}' removed from disk (was not in registry).",
-                    self.ok_mark(),
+                    self.mode.ok_mark(),
                     name
                 ))
             } else {
@@ -114,7 +93,7 @@ impl<'a> ZenOps<'a> {
         self.db.delete_env(name)?;
         Ok(format!(
             "{} Environment '{}' removed from registry (files kept on disk).",
-            self.ok_mark(),
+            self.mode.ok_mark(),
             name
         ))
     }
@@ -403,7 +382,7 @@ impl<'a> ZenOps<'a> {
             .add_comment(&uuid, &project_path, env_id, message, Some(&tag))?;
 
         let msg = if let Some(name) = env_name {
-            if self.colored {
+            if self.mode == OutputMode::Cli {
                 format!(
                     "{} comment logged to {} history (UUID: {}).",
                     "✓".green(),
@@ -413,7 +392,7 @@ impl<'a> ZenOps<'a> {
             } else {
                 format!("✓ comment logged to {} history (UUID: {}).", name, uuid)
             }
-        } else if self.colored {
+        } else if self.mode == OutputMode::Cli {
             format!(
                 "{} comment logged to project history (UUID: {}).",
                 "✓".green(),
@@ -615,7 +594,7 @@ impl<'a> ZenOps<'a> {
 
         Ok(format!(
             "\n{} Imported {} environment{}, skipped {}.",
-            self.ok_mark(),
+            self.mode.ok_mark(),
             imported,
             if imported == 1 { "" } else { "s" },
             skipped

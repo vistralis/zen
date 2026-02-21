@@ -77,7 +77,7 @@ fn test_environment_inference() {
     let venv_path = zen::utils::get_current_venv_path();
     assert_eq!(venv_path, Some(env_path.to_str().unwrap().to_string()));
 
-    let ops = zen::ops::ZenOps::new(&db, temp_dir.clone());
+    let ops = zen::ops::ZenOps::new(&db, temp_dir.clone(), zen::context::OutputMode::Plain);
     let inferred = ops.infer_current_env().unwrap();
     assert_eq!(inferred, Some("inference-env".to_string()));
 
@@ -105,7 +105,7 @@ fn test_list_status_verification() {
     let db_path = temp_dir.join("test.db");
 
     let db = zen::db::Database::open(Some(&db_path)).unwrap();
-    let ops = zen::ops::ZenOps::new(&db, temp_dir.clone());
+    let ops = zen::ops::ZenOps::new(&db, temp_dir.clone(), zen::context::OutputMode::Plain);
 
     // Register real path
     let real_env = temp_dir.join("real-env");
@@ -145,7 +145,7 @@ fn test_bulk_import() {
     fs::write(env2.join("bin/python"), "").unwrap();
 
     let db = zen::db::Database::open(Some(&db_path)).unwrap();
-    let ops = zen::ops::ZenOps::new(&db, temp_dir.clone());
+    let ops = zen::ops::ZenOps::new(&db, temp_dir.clone(), zen::context::OutputMode::Plain);
 
     // Test discovery
     let found = zen::utils::discover_venvs(&temp_dir);
