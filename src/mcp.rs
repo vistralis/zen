@@ -5,10 +5,27 @@
 //! This module implements an MCP server using the official rmcp SDK,
 //! allowing Zen to interface with AI agents (like Antigravity or Claude Desktop).
 //!
-//! Environment names are validated at the MCP boundary via `EnvName` deserialization.
+//! ## Tool Surface (v0.7.0)
+//!
+//! 11 tools total: 6 standalone + 5 action-dispatch.
+//! All tools return structured JSON for programmatic agent reasoning.
+//!
+//! | Tool | Type | Actions |
+//! |------|------|---------|
+//! | `get_version` | standalone | — |
+//! | `list_environments` | standalone | label filter |
+//! | `run_in_environment` | standalone | — |
+//! | `compare_environments` | standalone | — |
+//! | `install_packages` | standalone | install with full options |
+//! | `uninstall_packages` | standalone | simple package removal |
+//! | `manage_environment` | dispatch | create, remove, rename, track, untrack |
+//! | `inspect_environment` | dispatch | details, health |
+//! | `find_package` | inferred | env_name present → details mode |
+//! | `manage_project` | dispatch | link, get_default, list |
+//! | `manage_metadata` | dispatch | add_note, get_notes, add_label, remove_label |
 
 use crate::db::Database;
-use crate::types::EnvName;
+use crate::types::{Diagnostic, EnvName};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -16,13 +33,11 @@ use rmcp::{
     schemars, tool, tool_router,
     transport::stdio,
 };
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Redacts a filesystem path for MCP responses.
-///
-/// Replaces full paths with `~/…/basename` to prevent sensitive directory
-/// structures from leaking into LLM provider logs.
 fn redact_path(path: &str) -> String {
     std::path::Path::new(path)
         .file_name()
@@ -30,51 +45,83 @@ fn redact_path(path: &str) -> String {
         .unwrap_or_else(|| "~/…".to_string())
 }
 
-/// Input parameter types for MCP tools
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct CreateEnvironmentParams {
-    #[schemars(description = "Name of the environment")]
-    pub name: EnvName,
-    #[schemars(description = "Python version (e.g., 3.12)")]
-    pub python: Option<String>,
+// =============================================================================
+// RESPONSE TYPES — Structured JSON for all tools
+// =============================================================================
+
+/// Standard success/error wrapper for all MCP responses.
+#[derive(Serialize)]
+struct McpResponse<T: Serialize> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<McpError>,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct AddEnvironmentParams {
-    #[schemars(description = "Absolute path to the virtual environment root directory")]
-    pub path: String,
-    #[schemars(description = "Optional name override. If omitted, the directory basename is used")]
-    pub name: Option<String>,
+#[derive(Serialize)]
+struct McpError {
+    code: String,
+    message: String,
+    retriable: bool,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct InstallPackagesParams {
-    #[schemars(description = "Name of the environment")]
-    pub env_name: EnvName,
-    #[schemars(
-        description = "Packages to install. Accepts PyPI names (numpy), version specs (numpy>=2.0), local wheel paths (/path/to/pkg.whl), and URLs"
-    )]
-    pub packages: Vec<String>,
-    #[schemars(
-        description = "Custom PyPI index URL (e.g., https://download.pytorch.org/whl/cu130)"
-    )]
-    pub index_url: Option<String>,
-    #[schemars(description = "Additional PyPI index URL (used alongside default PyPI)")]
-    pub extra_index_url: Option<String>,
-    #[schemars(description = "Include pre-release/development versions")]
-    pub pre: Option<bool>,
-    #[schemars(description = "Upgrade existing packages to latest version")]
-    pub upgrade: Option<bool>,
-    #[schemars(description = "Install in editable/development mode (-e)")]
-    pub editable: Option<bool>,
+impl<T: Serialize> McpResponse<T> {
+    fn ok(result: T) -> String {
+        serde_json::to_string(&McpResponse {
+            result: Some(result),
+            error: None,
+        })
+        .unwrap_or_else(|_| {
+            r#"{"error":{"code":"serialize","message":"serialization failed","retriable":false}}"#
+                .to_string()
+        })
+    }
 }
 
+fn mcp_err(code: &str, message: impl Into<String>, retriable: bool) -> String {
+    serde_json::to_string(&McpResponse::<()> {
+        result: None,
+        error: Some(McpError {
+            code: code.to_string(),
+            message: message.into(),
+            retriable,
+        }),
+    })
+    .unwrap_or_else(|_| {
+        r#"{"error":{"code":"unknown","message":"serialization failed","retriable":false}}"#
+            .to_string()
+    })
+}
+
+fn mcp_not_found(entity: &str, name: &str) -> String {
+    mcp_err(
+        "not_found",
+        format!("{} '{}' not found", entity, name),
+        false,
+    )
+}
+
+fn mcp_invalid(message: impl Into<String>) -> String {
+    mcp_err("invalid_params", message, false)
+}
+
+fn mcp_sys_err(e: impl std::fmt::Display) -> String {
+    mcp_err("system", e.to_string(), true)
+}
+
+// --- Response data structs (shared with CLI --json) ---
+use crate::output::*;
+
+// =============================================================================
+// PARAMETER TYPES
+// =============================================================================
+
+// --- Standalone params ---
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct UninstallPackagesParams {
-    #[schemars(description = "Name of the environment")]
-    pub env_name: EnvName,
-    #[schemars(description = "List of packages to uninstall")]
-    pub packages: Vec<String>,
+pub struct ListEnvironmentsParams {
+    #[schemars(description = "Optional label to filter by (e.g., 'ml', 'dev', 'favorite')")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -91,36 +138,10 @@ pub struct RunInEnvironmentParams {
         description = "Working directory for the command. Defaults to home directory if not specified."
     )]
     pub cwd: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct ListEnvironmentsParams {
-    #[schemars(description = "Optional label to filter by (e.g., 'ml', 'dev', 'favorite')")]
-    pub label: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct EnvNameParam {
-    #[schemars(description = "Name of the environment")]
-    pub env_name: EnvName,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct ProjectPathParam {
-    #[schemars(description = "Absolute path to the project directory")]
-    pub project_path: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct AssociateProjectParams {
-    #[schemars(description = "Absolute path to the project directory")]
-    pub project_path: String,
-    #[schemars(description = "Name of the environment to associate")]
-    pub env_name: EnvName,
-    #[schemars(description = "Optional tag like 'main', 'test', 'experiment'")]
-    pub tag: Option<String>,
-    #[schemars(description = "Set as default environment for this project")]
-    pub is_default: Option<bool>,
+    #[schemars(
+        description = "Path to save full command output (stdout+stderr). When provided, the complete untruncated output is written to this file and the path is returned in 'log_file'. The inline 'output' field still contains the truncated preview."
+    )]
+    pub log_path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -130,60 +151,116 @@ pub struct CompareEnvironmentsParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct AddEnvironmentNoteParams {
+pub struct InstallPackagesParams {
     #[schemars(description = "Name of the environment")]
     pub env_name: EnvName,
-    #[schemars(description = "The note to record (purpose, description, reminder)")]
-    pub note: String,
+    #[schemars(
+        description = "Packages to install. Accepts PyPI names (numpy), version specs (numpy>=2.0), local wheel paths (/path/to/pkg.whl), and URLs"
+    )]
+    pub packages: Vec<String>,
+    #[schemars(
+        description = "Custom PyPI index URL (e.g., https://download.pytorch.org/whl/cu130). Install only"
+    )]
+    pub index_url: Option<String>,
+    #[schemars(
+        description = "Additional PyPI index URL (used alongside default PyPI). Install only"
+    )]
+    pub extra_index_url: Option<String>,
+    #[schemars(description = "Include pre-release/development versions. Install only")]
+    pub pre: Option<bool>,
+    #[schemars(description = "Upgrade existing packages to latest version. Install only")]
+    pub upgrade: Option<bool>,
+    #[schemars(description = "Install in editable/development mode (-e). Install only")]
+    pub editable: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct SearchPackagesParams {
-    #[schemars(description = "Package name or partial name to search for")]
-    pub query: String,
+pub struct UninstallPackagesParams {
+    #[schemars(description = "Name of the environment")]
+    pub env_name: EnvName,
+    #[schemars(description = "Package names to uninstall")]
+    pub packages: Vec<String>,
 }
 
-/// Parameters for the `find_package` MCP tool.
+// --- Dispatch params ---
+
+/// Parameters for `manage_environment` — lifecycle operations.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ManageEnvironmentParams {
+    #[schemars(
+        description = "Action to perform: 'create', 'remove', 'rename', 'track', or 'untrack'"
+    )]
+    pub action: String,
+    #[schemars(description = "Environment name (required for create, remove, untrack)")]
+    pub name: Option<EnvName>,
+    #[schemars(description = "Python version (e.g., 3.12). Used with action 'create'")]
+    pub python: Option<String>,
+    #[schemars(description = "Absolute path to the virtual environment. Used with action 'track'")]
+    pub path: Option<String>,
+    #[schemars(description = "Current name. Used with action 'rename'")]
+    pub old_name: Option<String>,
+    #[schemars(description = "New name. Used with action 'rename'")]
+    pub new_name: Option<String>,
+}
+
+/// Parameters for `inspect_environment` — read environment state.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct InspectEnvironmentParams {
+    #[schemars(description = "Action: 'details' or 'health'")]
+    pub action: String,
+    #[schemars(description = "Name of the environment")]
+    pub env_name: EnvName,
+}
+
+/// Parameters for `find_package` — search across envs or get details in one env.
 ///
-/// Accepts a query string supporting three modes:
-/// - Exact match: `torch`
-/// - Wildcard: `*torch*` (glob-style contains)
-/// - Version pinning: `torch==2.10` (CUDA-aware base version match)
+/// When `env_name` is provided, returns detailed info for the package in that env.
+/// Otherwise, searches across all environments (substring match, wildcards, version pinning).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct FindPackageParams {
     #[schemars(
         description = "Package name or pattern. Supports wildcards (*torch*) and version pinning (torch==2.10). CUDA-aware: 'torch==2.10' matches '2.10.0+cu130'"
     )]
     pub query: String,
+    #[schemars(
+        description = "Optional: environment name. When provided, returns detailed package info (version, installer, source, editable status) instead of cross-environment search"
+    )]
+    pub env_name: Option<EnvName>,
 }
 
-/// Parameters for the `get_package_details` MCP tool.
-///
-/// Retrieves full installation metadata for a single package
-/// in a specific environment using L4 filesystem scan.
+/// Parameters for `manage_project` — project-environment links.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct PackageDetailsParams {
+pub struct ManageProjectParams {
+    #[schemars(description = "Action: 'link', 'get_default', or 'list'")]
+    pub action: String,
+    #[schemars(description = "Absolute path to the project directory")]
+    pub project_path: String,
+    #[schemars(description = "Environment to link. Required for action 'link'")]
+    pub env_name: Option<EnvName>,
+    #[schemars(description = "Optional tag like 'main', 'test', 'experiment'. Used with 'link'")]
+    pub tag: Option<String>,
+    #[schemars(description = "Set as default environment for this project. Used with 'link'")]
+    pub is_default: Option<bool>,
+}
+
+/// Parameters for `manage_metadata` — notes and labels.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ManageMetadataParams {
+    #[schemars(description = "Action: 'add_note', 'get_notes', 'add_label', or 'remove_label'")]
+    pub action: String,
     #[schemars(description = "Name of the environment")]
     pub env_name: EnvName,
-    #[schemars(description = "Package name to get details for")]
-    pub package: String,
+    #[schemars(description = "The note text. Required for action 'add_note'")]
+    pub note: Option<String>,
+    #[schemars(
+        description = "Label to add or remove (e.g., ml, dev, testing). Required for 'add_label' and 'remove_label'"
+    )]
+    pub label: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct LabelParams {
-    #[schemars(description = "Name of the environment")]
-    pub env_name: EnvName,
-    #[schemars(description = "Label to add or remove (e.g., ml, dev, testing)")]
-    pub label: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct RenameParams {
-    #[schemars(description = "Current name of the environment")]
-    pub old_name: String,
-    #[schemars(description = "New name for the environment")]
-    pub new_name: String,
-}
+// =============================================================================
+// MCP SERVER
+// =============================================================================
 
 /// The Zen MCP Server.
 #[derive(Clone)]
@@ -194,7 +271,6 @@ pub struct ZenMcpServer {
 }
 
 impl ZenMcpServer {
-    /// Creates a new ZenMcpServer instance.
     pub fn new(db: Database, home: PathBuf) -> Self {
         Self {
             db: Arc::new(Mutex::new(db)),
@@ -204,70 +280,330 @@ impl ZenMcpServer {
     }
 }
 
+// =============================================================================
+// TOOL IMPLEMENTATIONS — 11 tools
+// =============================================================================
+
 #[tool_router]
 impl ZenMcpServer {
+    // -------------------------------------------------------------------------
+    // 1. get_version (standalone)
+    // -------------------------------------------------------------------------
     #[tool(description = "Get the version of the running Zen server")]
     fn get_version(&self) -> String {
-        format!("zen {}", env!("ZEN_VERSION"))
+        McpResponse::ok(VersionResponse {
+            version: format!("zen {}", env!("ZEN_VERSION")),
+        })
     }
 
+    // -------------------------------------------------------------------------
+    // 2. list_environments (standalone)
+    // -------------------------------------------------------------------------
     #[tool(
         description = "List all managed Python environments with their Python versions and paths"
     )]
     fn list_environments(&self, Parameters(params): Parameters<ListEnvironmentsParams>) -> String {
         let db = self.db.lock().unwrap();
+
+        // Auto-discover ZEN_HOME environments (same as CLI zen list).
+        // Directory is truth — scan disk first, then query DB.
+        if self.home.exists()
+            && let Ok(entries) = std::fs::read_dir(&self.home)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && (path.join("bin/python").exists() || path.join("bin/python3").exists())
+                {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if db.get_env_id(&name).ok().flatten().is_none() {
+                        let path_str = path.to_string_lossy().to_string();
+                        let py_ver = crate::utils::read_python_version(&path_str)
+                            .unwrap_or_else(|| "unknown".to_string());
+                        if let Err(e) = db.register_env(&name, &path_str, &py_ver) {
+                            eprintln!("Warning: failed to register env '{}': {}", name, e);
+                        }
+                    }
+                    // Collision detection is silent in MCP (no stderr),
+                    // but the tracked alias takes precedence by design.
+                }
+            }
+        }
+
         let ops =
             crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.list_envs() {
             Ok(envs) => {
-                let mut output = String::new();
+                let mut result: Vec<EnvSummary> = Vec::new();
                 for (name, path, py_ver, ..) in &envs {
-                    // Filter by label if specified
                     if let Some(ref label) = params.label {
                         let labels = db.get_labels(name).unwrap_or_default();
                         if !labels.iter().any(|l| l == label) {
                             continue;
                         }
                     }
-                    output.push_str(&format!(
-                        "• {} (Python {}) - {}\n",
-                        name,
-                        py_ver,
-                        redact_path(path)
-                    ));
+                    result.push(EnvSummary {
+                        name: name.clone(),
+                        python: py_ver.clone(),
+                        path: redact_path(path),
+                    });
                 }
-                if output.is_empty() {
-                    if let Some(label) = params.label {
-                        format!("No environments found with label '{}'", label)
-                    } else {
-                        "No environments found.".to_string()
-                    }
-                } else {
-                    output
-                }
+                McpResponse::ok(result)
             }
-            Err(e) => format!("Error: {}", e),
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(description = "Create a new Python virtual environment")]
-    fn create_environment(
+    // -------------------------------------------------------------------------
+    // 3. run_in_environment (standalone)
+    // -------------------------------------------------------------------------
+    #[tool(
+        description = "Run a command inside an environment without activating it. Returns stdout/stderr output (capped at 10KB). Use 'log_path' to save full untruncated output to a file when output may exceed 10KB. Example: command=['python', '-c', 'import torch; print(torch.__version__)']"
+    )]
+    fn run_in_environment(&self, Parameters(params): Parameters<RunInEnvironmentParams>) -> String {
+        let db = self.db.lock().unwrap();
+
+        let env_name = params.env_name.clone();
+        let command = params.command;
+
+        let envs = match db.list_envs() {
+            Ok(e) => e,
+            Err(e) => return mcp_sys_err(e),
+        };
+        let env_entry = envs.iter().find(|(n, ..)| n == env_name.as_str());
+        let env_path = match env_entry {
+            Some((_, path, ..)) => path.clone(),
+            None => return mcp_not_found("Environment", env_name.as_str()),
+        };
+        drop(db);
+
+        let timeout_secs = params.timeout.unwrap_or(120);
+        let cwd = params.cwd;
+        let log_path = params.log_path;
+
+        let handle = std::thread::spawn(move || {
+            if command.is_empty() {
+                return Err("No command specified".to_string());
+            }
+            let env_p = std::path::Path::new(&env_path);
+            let bin_path = env_p.join("bin");
+            let exe_path = bin_path.join(&command[0]);
+            let program = if exe_path.exists() {
+                exe_path.to_string_lossy().to_string()
+            } else {
+                command[0].clone()
+            };
+            let path_var = std::env::var("PATH").unwrap_or_default();
+
+            let mut cmd = std::process::Command::new(&program);
+            cmd.args(&command[1..])
+                .env("PATH", format!("{}:{}", bin_path.display(), path_var))
+                .env("VIRTUAL_ENV", env_p)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if let Some(ref dir) = cwd {
+                cmd.current_dir(dir);
+            }
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| format!("Failed to execute: {}", e))?;
+
+            if timeout_secs == 0 {
+                let output = child
+                    .wait_with_output()
+                    .map_err(|e| format!("Failed to wait: {}", e))?;
+                let exit_code = output.status.code().unwrap_or(-1);
+                let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.is_empty() {
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&stderr);
+                }
+                Ok((exit_code, combined, false))
+            } else {
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let mut stdout_buf = Vec::new();
+                            let mut stderr_buf = Vec::new();
+                            use std::io::Read;
+                            if let Some(ref mut out) = child.stdout {
+                                let _ = out.read_to_end(&mut stdout_buf);
+                            }
+                            if let Some(ref mut err) = child.stderr {
+                                let _ = err.read_to_end(&mut stderr_buf);
+                            }
+                            let exit_code = status.code().unwrap_or(-1);
+                            let mut combined = String::from_utf8_lossy(&stdout_buf).to_string();
+                            let stderr = String::from_utf8_lossy(&stderr_buf);
+                            if !stderr.is_empty() {
+                                if !combined.is_empty() {
+                                    combined.push('\n');
+                                }
+                                combined.push_str(&stderr);
+                            }
+                            return Ok((exit_code, combined, false));
+                        }
+                        Ok(None) => {
+                            if std::time::Instant::now() >= deadline {
+                                let _ = child.kill();
+                                let _ = child.wait(); // Reap zombie
+                                return Ok((
+                                    -1,
+                                    format!("Command timed out after {}s", timeout_secs),
+                                    true,
+                                ));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        Err(e) => return Err(format!("Error waiting for process: {}", e)),
+                    }
+                }
+            }
+        });
+
+        match handle.join() {
+            Ok(Ok((code, output, timed_out))) => {
+                // Write full output to log file if requested
+                let log_file = log_path.and_then(|path| match std::fs::write(&path, &output) {
+                    Ok(()) => Some(path),
+                    Err(e) => {
+                        eprintln!("Warning: failed to write log to {}: {}", path, e);
+                        None
+                    }
+                });
+
+                let truncated = output.len() > 10240;
+                let output = if truncated {
+                    output[..10240].to_string()
+                } else {
+                    output
+                };
+                McpResponse::ok(RunResult {
+                    exit_code: code,
+                    output,
+                    truncated: if truncated { Some(true) } else { None },
+                    timed_out: if timed_out { Some(true) } else { None },
+                    log_file,
+                })
+            }
+            Ok(Err(e)) => mcp_err("exec_failed", e, true),
+            Err(_) => mcp_err("panic", "Command execution panicked", false),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. compare_environments (standalone)
+    // -------------------------------------------------------------------------
+    #[tool(description = "Compare two environments side-by-side")]
+    fn compare_environments(
         &self,
-        Parameters(params): Parameters<CreateEnvironmentParams>,
+        Parameters(params): Parameters<CompareEnvironmentsParams>,
     ) -> String {
         let db = self.db.lock().unwrap();
         let ops =
             crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
-        match ops.create_env(&params.name, params.python) {
-            Ok(msg) => msg,
-            Err(e) => format!("Error: {}", e),
+        if params.env_names.len() != 2 {
+            return mcp_invalid("Exactly two environment names are required");
+        }
+
+        match ops.list_envs() {
+            Ok(all_envs) => {
+                let mut environments = Vec::new();
+                let mut env_packages: Vec<(String, std::collections::HashMap<String, String>)> =
+                    Vec::new();
+
+                for name in &params.env_names {
+                    let env = all_envs.iter().find(|(n, ..)| n == name);
+                    if let Some((_, path, py_ver, ..)) = env {
+                        let packages = crate::utils::get_packages(path);
+                        let pkg_map: std::collections::HashMap<String, String> = packages
+                            .into_iter()
+                            .map(|p| {
+                                (
+                                    p.name.to_lowercase(),
+                                    p.version.unwrap_or_else(|| "?".into()),
+                                )
+                            })
+                            .collect();
+                        environments.push(EnvCompare {
+                            name: name.clone(),
+                            python: py_ver.clone(),
+                            packages: pkg_map.len(),
+                        });
+                        env_packages.push((name.clone(), pkg_map));
+                    } else {
+                        return mcp_not_found("Environment", name);
+                    }
+                }
+
+                let mut version_diffs = Vec::new();
+                let mut only_in = Vec::new();
+
+                {
+                    let (ref n1, ref pkgs1) = env_packages[0];
+                    let (ref n2, ref pkgs2) = env_packages[1];
+
+                    for (name, v1) in pkgs1 {
+                        if let Some(v2) = pkgs2.get(name)
+                            && v1 != v2
+                        {
+                            version_diffs.push(VersionDiff {
+                                package: name.clone(),
+                                versions: vec![v1.clone(), v2.clone()],
+                            });
+                        }
+                    }
+                    version_diffs.sort_by(|a, b| a.package.cmp(&b.package));
+
+                    let mut o1: Vec<String> = pkgs1
+                        .keys()
+                        .filter(|k| !pkgs2.contains_key(*k))
+                        .cloned()
+                        .collect();
+                    o1.sort();
+                    if !o1.is_empty() {
+                        only_in.push(OnlyIn {
+                            env: n1.clone(),
+                            packages: o1,
+                        });
+                    }
+
+                    let mut o2: Vec<String> = pkgs2
+                        .keys()
+                        .filter(|k| !pkgs1.contains_key(*k))
+                        .cloned()
+                        .collect();
+                    o2.sort();
+                    if !o2.is_empty() {
+                        only_in.push(OnlyIn {
+                            env: n2.clone(),
+                            packages: o2,
+                        });
+                    }
+                }
+
+                McpResponse::ok(ComparisonResult {
+                    environments,
+                    version_diffs,
+                    only_in,
+                })
+            }
+            Err(e) => mcp_sys_err(e),
         }
     }
 
+    // -------------------------------------------------------------------------
+    // 5. install_packages (standalone)
+    // -------------------------------------------------------------------------
     #[tool(
-        description = "Install packages into an environment using pip/uv. Supports: PyPI packages ['numpy', 'pandas>=2.0'], local wheels ['/path/to/package.whl'], editable installs (editable=true), CUDA PyTorch (use index_url='https://download.pytorch.org/whl/cu130'), pre-release (pre=true), upgrade (upgrade=true)"
+        description = "Install packages into an environment. Supports PyPI names, version specs, wheels, editable installs, custom index URLs, pre-release, and upgrade"
     )]
     fn install_packages(&self, Parameters(params): Parameters<InstallPackagesParams>) -> String {
         let db = self.db.lock().unwrap();
@@ -290,13 +626,16 @@ impl ZenMcpServer {
                     "install",
                     &format!("{} {}", params.env_name.as_str(), params.packages.join(" ")),
                 );
-                msg
+                McpResponse::ok(ActionResult { message: msg })
             }
-            Err(e) => format!("Error: {}", e),
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(description = "Uninstall packages from an environment")]
+    // -------------------------------------------------------------------------
+    // 6. uninstall_packages (standalone)
+    // -------------------------------------------------------------------------
+    #[tool(description = "Remove packages from an environment")]
     fn uninstall_packages(
         &self,
         Parameters(params): Parameters<UninstallPackagesParams>,
@@ -312,79 +651,275 @@ impl ZenMcpServer {
                     "uninstall",
                     &format!("{} {}", params.env_name.as_str(), params.packages.join(" ")),
                 );
-                msg
+                McpResponse::ok(ActionResult { message: msg })
             }
-            Err(e) => format!("Error: {}", e),
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(description = "Remove an environment from the database and delete it from disk")]
-    fn remove_environment(&self, Parameters(params): Parameters<EnvNameParam>) -> String {
+    // -------------------------------------------------------------------------
+    // 7. manage_environment (dispatch: create/remove/rename/track/untrack)
+    // -------------------------------------------------------------------------
+    #[tool(
+        description = "Manage environment lifecycle. Actions: 'create' (name, python), 'remove' (name), 'rename' (old_name, new_name), 'track' (path, name?), 'untrack' (name)"
+    )]
+    fn manage_environment(
+        &self,
+        Parameters(params): Parameters<ManageEnvironmentParams>,
+    ) -> String {
+        match params.action.as_str() {
+            "create" => self.do_create_environment(params),
+            "remove" => self.do_remove_environment(params),
+            "rename" => self.do_rename_environment(params),
+            "track" => self.do_track_environment(params),
+            "untrack" => self.do_untrack_environment(params),
+            _ => mcp_invalid(format!(
+                "Unknown action '{}'. Use: create, remove, rename, track, untrack",
+                params.action
+            )),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 8. inspect_environment (dispatch: details/health)
+    // -------------------------------------------------------------------------
+    #[tool(
+        description = "Inspect an environment. Actions: 'details' (Python version, packages, ML frameworks, creation date), 'health' (package conflicts, missing dependencies, CUDA consistency)"
+    )]
+    fn inspect_environment(
+        &self,
+        Parameters(params): Parameters<InspectEnvironmentParams>,
+    ) -> String {
+        match params.action.as_str() {
+            "details" => self.do_get_details(&params.env_name),
+            "health" => self.do_get_health(&params.env_name),
+            _ => mcp_invalid(format!(
+                "Unknown action '{}'. Use: details, health",
+                params.action
+            )),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 9. find_package (inferred: search or details based on env_name)
+    // -------------------------------------------------------------------------
+    #[tool(
+        description = "Find a package across all environments, or get detailed info for a specific package in one environment. Supports wildcards (*torch*) and version pinning (torch==2.10). CUDA-aware: queries without +cuXXX match base version. When env_name is provided, returns detailed package info (version, installer, source, editable status, git commit)"
+    )]
+    fn find_package(&self, Parameters(params): Parameters<FindPackageParams>) -> String {
+        if let Some(ref env_name) = params.env_name {
+            self.do_get_package_details(env_name, &params.query)
+        } else {
+            self.do_find_package_cross_env(&params.query)
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 10. manage_project (dispatch: link/get_default/list)
+    // -------------------------------------------------------------------------
+    #[tool(
+        description = "Manage project-environment links. Actions: 'link' (project_path, env_name, tag?, is_default?), 'get_default' (project_path), 'list' (project_path)"
+    )]
+    fn manage_project(&self, Parameters(params): Parameters<ManageProjectParams>) -> String {
+        match params.action.as_str() {
+            "link" => self.do_associate_project(params),
+            "get_default" => self.do_get_default_environment(&params.project_path),
+            "list" => self.do_get_project_environments(&params.project_path),
+            _ => mcp_invalid(format!(
+                "Unknown action '{}'. Use: link, get_default, list",
+                params.action
+            )),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 11. manage_metadata (dispatch: add_note/get_notes/add_label/remove_label)
+    // -------------------------------------------------------------------------
+    #[tool(
+        description = "Manage environment metadata (notes and labels). Actions: 'add_note' (env_name, note), 'get_notes' (env_name), 'add_label' (env_name, label), 'remove_label' (env_name, label)"
+    )]
+    fn manage_metadata(&self, Parameters(params): Parameters<ManageMetadataParams>) -> String {
+        match params.action.as_str() {
+            "add_note" => self.do_add_note(&params.env_name, params.note.as_deref()),
+            "get_notes" => self.do_get_notes(&params.env_name),
+            "add_label" => self.do_add_label(&params.env_name, params.label.as_deref()),
+            "remove_label" => self.do_remove_label(&params.env_name, params.label.as_deref()),
+            _ => mcp_invalid(format!(
+                "Unknown action '{}'. Use: add_note, get_notes, add_label, remove_label",
+                params.action
+            )),
+        }
+    }
+}
+
+// =============================================================================
+// PRIVATE DISPATCH IMPLEMENTATIONS
+// =============================================================================
+
+impl ZenMcpServer {
+    // --- manage_environment dispatches ---
+
+    fn do_create_environment(&self, params: ManageEnvironmentParams) -> String {
+        let name = match params.name {
+            Some(n) => n,
+            None => return mcp_invalid("'name' is required for action 'create'"),
+        };
+        let db = self.db.lock().unwrap();
+
+        // Guard: reject if name already exists in DB (prevents duplicates after rename)
+        match db.get_env_id(&name) {
+            Ok(Some(_)) => {
+                return mcp_err(
+                    "already_exists",
+                    format!("Environment '{}' already exists", name),
+                    false,
+                );
+            }
+            Ok(None) => {}
+            Err(e) => return mcp_sys_err(e),
+        }
+
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
+        match ops.create_env(&name, params.python) {
+            Ok(msg) => McpResponse::ok(ActionResult { message: msg }),
+            Err(e) => mcp_sys_err(e),
+        }
+    }
+
+    fn do_remove_environment(&self, params: ManageEnvironmentParams) -> String {
+        let name = match params.name {
+            Some(n) => n,
+            None => return mcp_invalid("'name' is required for action 'remove'"),
+        };
         let db = self.db.lock().unwrap();
         let ops =
             crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
-
-        match crate::types::EnvName::new(params.env_name.to_string()) {
-            Ok(name) => match ops.remove_env(&name) {
-                Ok(msg) => {
-                    crate::activity_log::log_activity("mcp", "rm", name.as_str());
-                    msg
-                }
-                Err(e) => format!("Error: {}", e),
-            },
-            Err(e) => format!("Error: {}", e),
+        match ops.remove_env(&name) {
+            Ok(msg) => {
+                crate::activity_log::log_activity("mcp", "rm", name.as_str());
+                McpResponse::ok(ActionResult { message: msg })
+            }
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(description = "Rename an existing environment")]
-    fn rename_environment(&self, Parameters(params): Parameters<RenameParams>) -> String {
+    fn do_rename_environment(&self, params: ManageEnvironmentParams) -> String {
+        let old_name_str = match params.old_name {
+            Some(n) => n,
+            None => return mcp_invalid("'old_name' is required for action 'rename'"),
+        };
+        let new_name_str = match params.new_name {
+            Some(n) => n,
+            None => return mcp_invalid("'new_name' is required for action 'rename'"),
+        };
+
+        let old = match crate::types::EnvName::new(&old_name_str) {
+            Ok(n) => n,
+            Err(e) => return mcp_invalid(e.to_string()),
+        };
+        let new = match crate::types::EnvName::new(&new_name_str) {
+            Ok(n) => n,
+            Err(e) => return mcp_invalid(e.to_string()),
+        };
+
         let db = self.db.lock().unwrap();
 
-        let old = match crate::types::EnvName::new(&params.old_name) {
-            Ok(n) => n,
-            Err(e) => return format!("Error: {}", e),
-        };
-        let new = match crate::types::EnvName::new(&params.new_name) {
-            Ok(n) => n,
-            Err(e) => return format!("Error: {}", e),
-        };
-
-        // Verify old exists
+        // Check old name exists
         match db.get_env_id(&old) {
             Ok(Some(_)) => {}
-            Ok(None) => return format!("Error: environment '{}' not found", old),
-            Err(e) => return format!("Error: {}", e),
+            Ok(None) => return mcp_not_found("Environment", old.as_str()),
+            Err(e) => return mcp_sys_err(e),
         }
-
-        // Verify new doesn't exist
+        // Check new name doesn't collide
         match db.get_env_id(&new) {
-            Ok(Some(_)) => return format!("Error: environment '{}' already exists", new),
+            Ok(Some(_)) => {
+                return mcp_err(
+                    "already_exists",
+                    format!("Environment '{}' already exists", new),
+                    false,
+                );
+            }
             Ok(None) => {}
-            Err(e) => return format!("Error: {}", e),
+            Err(e) => return mcp_sys_err(e),
         }
 
-        match db.rename_environment(&params.old_name, &params.new_name) {
-            Ok(true) => {
-                crate::activity_log::log_activity(
-                    "mcp",
-                    "rename",
-                    &format!("{} -> {}", params.old_name, params.new_name),
+        // Get current path to determine managed vs tracked
+        let current_path = match db.get_env_path(old.as_str()) {
+            Ok(Some(p)) => p,
+            Ok(None) => return mcp_not_found("Environment", old.as_str()),
+            Err(e) => return mcp_sys_err(e),
+        };
+
+        let path = std::path::Path::new(&current_path);
+        let is_managed = path.starts_with(&self.home);
+
+        if is_managed {
+            // Managed env: rename directory on disk + update name and path in DB
+            let new_path = self.home.join(new.as_str());
+            if new_path.exists() {
+                return mcp_err(
+                    "already_exists",
+                    format!(
+                        "Directory '{}' already exists on disk",
+                        redact_path(&new_path.to_string_lossy())
+                    ),
+                    false,
                 );
-                format!("Renamed '{}' → '{}'", params.old_name, params.new_name)
             }
-            Ok(false) => "Error: rename failed".to_string(),
-            Err(e) => format!("Error: {}", e),
+
+            if let Err(e) = std::fs::rename(path, &new_path) {
+                return mcp_err("system", format!("Failed to rename directory: {}", e), true);
+            }
+
+            let new_path_str = new_path.to_string_lossy().to_string();
+            match db.rename_environment_with_path(&old_name_str, &new_name_str, &new_path_str) {
+                Ok(true) => {
+                    crate::activity_log::log_activity(
+                        "mcp",
+                        "rename",
+                        &format!("{} -> {} (managed, dir moved)", old_name_str, new_name_str),
+                    );
+                    McpResponse::ok(ActionResult {
+                        message: format!(
+                            "Renamed '{}' → '{}' (managed — directory moved)",
+                            old_name_str, new_name_str
+                        ),
+                    })
+                }
+                Ok(false) => mcp_err("rename_failed", "DB rename failed after dir move", true),
+                Err(e) => mcp_sys_err(e),
+            }
+        } else {
+            // Tracked env: only change alias in DB, path stays unchanged
+            match db.rename_environment(&old_name_str, &new_name_str) {
+                Ok(true) => {
+                    crate::activity_log::log_activity(
+                        "mcp",
+                        "rename",
+                        &format!("{} -> {} (tracked, alias only)", old_name_str, new_name_str),
+                    );
+                    McpResponse::ok(ActionResult {
+                        message: format!(
+                            "Renamed '{}' → '{}' (tracked — alias updated, path unchanged)",
+                            old_name_str, new_name_str
+                        ),
+                    })
+                }
+                Ok(false) => mcp_err("rename_failed", "Rename failed", true),
+                Err(e) => mcp_sys_err(e),
+            }
         }
     }
 
-    #[tool(
-        description = "Track (register) an existing virtual environment by path. The path can be a venv root directory, or a bin/python* or bin/activate file within it. Pairs with untrack_environment to remove from registry without deleting files."
-    )]
-    fn track_environment(&self, Parameters(params): Parameters<AddEnvironmentParams>) -> String {
+    fn do_track_environment(&self, params: ManageEnvironmentParams) -> String {
+        let path_str = match params.path {
+            Some(p) => p,
+            None => return mcp_invalid("'path' is required for action 'track'"),
+        };
         let db = self.db.lock().unwrap();
-        let path = std::path::PathBuf::from(&params.path);
+        let path = std::path::PathBuf::from(&path_str);
 
-        // Resolve path: accept venv root, bin/python*, or bin/activate
         let fname = path.file_name().unwrap_or_default().to_string_lossy();
         let parent_is_bin = path
             .parent()
@@ -401,17 +936,28 @@ impl ZenMcpServer {
 
         let resolved = match resolved.canonicalize() {
             Ok(p) => p,
-            Err(_) => return format!("Error: Path does not exist: {}", resolved.display()),
+            Err(_) => {
+                return mcp_not_found("Path", &resolved.to_string_lossy());
+            }
         };
 
         if !resolved.join("bin/python").exists() {
-            return format!(
-                "Error: Not a valid virtual environment (no bin/python): {}",
+            return mcp_invalid(format!(
+                "Not a valid virtual environment (no bin/python): {}",
                 resolved.display()
-            );
+            ));
         }
 
-        let env_name_str = params.name.unwrap_or_else(|| {
+        // Guard: reject tracking envs inside ZEN_HOME — they are managed by auto-discovery.
+        // Allowing aliases for ZEN_HOME envs would break the directory-is-truth invariant.
+        if resolved.starts_with(&self.home) {
+            return mcp_invalid(format!(
+                "Cannot track environments inside ZEN_HOME ({}). Environments there are managed automatically.",
+                redact_path(&self.home.to_string_lossy())
+            ));
+        }
+
+        let env_name_str = params.name.map(|n| n.to_string()).unwrap_or_else(|| {
             resolved
                 .file_name()
                 .unwrap_or_default()
@@ -421,510 +967,211 @@ impl ZenMcpServer {
 
         let env_name = match crate::types::EnvName::new(&env_name_str) {
             Ok(n) => n,
-            Err(e) => return format!("Error: {}", e),
+            Err(e) => return mcp_invalid(e.to_string()),
         };
 
         if db.get_env_id(&env_name).ok().flatten().is_some() {
-            return format!("Error: Environment '{}' already registered.", env_name);
+            return mcp_err(
+                "already_exists",
+                format!("Environment '{}' already registered", env_name),
+                false,
+            );
         }
-        let path_str = resolved.to_string_lossy().to_string();
-        if let Ok(Some(existing)) = db.get_env_name_by_path(&path_str) {
-            return format!("Error: Path already registered as '{}'.", existing);
+        let resolved_str = resolved.to_string_lossy().to_string();
+        if let Ok(Some(existing)) = db.get_env_name_by_path(&resolved_str) {
+            return mcp_err(
+                "already_exists",
+                format!("Path already registered as '{}'", existing),
+                false,
+            );
         }
 
         let py_ver =
             crate::utils::read_python_version(&resolved).unwrap_or_else(|| "unknown".to_string());
 
-        match db.register_env(&env_name_str, &path_str, &py_ver) {
+        match db.register_env(&env_name_str, &resolved_str, &py_ver) {
             Ok(_) => {
                 crate::activity_log::log_activity(
                     "mcp",
                     "add",
-                    &format!("{} -> {}", env_name, redact_path(&path_str)),
+                    &format!("{} -> {}", env_name, redact_path(&resolved_str)),
                 );
-                format!(
-                    "Registered '{}' (Python {}) at {}",
-                    env_name,
-                    py_ver,
-                    redact_path(&path_str)
-                )
+                McpResponse::ok(ActionResult {
+                    message: format!(
+                        "Registered '{}' (Python {}) at {}",
+                        env_name,
+                        py_ver,
+                        redact_path(&resolved_str)
+                    ),
+                })
             }
-            Err(e) => format!("Error: {}", e),
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(
-        description = "Remove an environment from the database only, keeping files on disk. Use this when an environment was registered with add_environment and should be untracked without deleting any files."
-    )]
-    fn untrack_environment(&self, Parameters(params): Parameters<EnvNameParam>) -> String {
-        let db = self.db.lock().unwrap();
-        let ops =
-            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
-
-        match crate::types::EnvName::new(params.env_name.to_string()) {
-            Ok(name) => match ops.untrack_env(&name) {
-                Ok(msg) => {
-                    crate::activity_log::log_activity("mcp", "rm:cached", name.as_str());
-                    msg
-                }
-                Err(e) => format!("Error: {}", e),
-            },
-            Err(e) => format!("Error: {}", e),
-        }
-    }
-
-    #[tool(
-        description = "Run a command inside an environment without activating it. Returns stdout/stderr output (capped at 10KB). Example: command=['python', '-c', 'import torch; print(torch.__version__)']"
-    )]
-    fn run_in_environment(&self, Parameters(params): Parameters<RunInEnvironmentParams>) -> String {
-        let db = self.db.lock().unwrap();
-
-        // Run in a separate thread with a timeout to prevent blocking the MCP server
-        let env_name = params.env_name.clone();
-        let command = params.command;
-
-        // Resolve the environment path before spawning the thread
-        let envs = match db.list_envs() {
-            Ok(e) => e,
-            Err(e) => return format!("Error: {}", e),
+    fn do_untrack_environment(&self, params: ManageEnvironmentParams) -> String {
+        let name = match params.name {
+            Some(n) => n,
+            None => return mcp_invalid("'name' is required for action 'untrack'"),
         };
-        let env_entry = envs.iter().find(|(n, ..)| n == env_name.as_str());
-        let env_path = match env_entry {
-            Some((_, path, ..)) => path.clone(),
-            None => return format!("Error: Environment '{}' not found", env_name),
-        };
-        drop(db); // Release the mutex before spawning
-
-        let timeout_secs = params.timeout.unwrap_or(120);
-        let cwd = params.cwd;
-
-        let handle = std::thread::spawn(move || {
-            // Build and run the command directly (mirrors ops.run_in_env logic)
-            if command.is_empty() {
-                return Err("No command specified".to_string());
-            }
-            let env_p = std::path::Path::new(&env_path);
-            let bin_path = env_p.join("bin");
-            let exe_path = bin_path.join(&command[0]);
-            let program = if exe_path.exists() {
-                exe_path.to_string_lossy().to_string()
-            } else {
-                command[0].clone()
-            };
-            let path_var = std::env::var("PATH").unwrap_or_default();
-
-            // Use spawn + wait for timeout support
-            let mut cmd = std::process::Command::new(&program);
-            cmd.args(&command[1..])
-                .env("PATH", format!("{}:{}", bin_path.display(), path_var))
-                .env("VIRTUAL_ENV", env_p)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            if let Some(ref dir) = cwd {
-                cmd.current_dir(dir);
-            }
-            let mut child = cmd
-                .spawn()
-                .map_err(|e| format!("Failed to execute: {}", e))?;
-
-            if timeout_secs == 0 {
-                // No timeout — wait indefinitely
-                let output = child
-                    .wait_with_output()
-                    .map_err(|e| format!("Failed to wait: {}", e))?;
-                let exit_code = output.status.code().unwrap_or(-1);
-                let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.is_empty() {
-                    if !combined.is_empty() {
-                        combined.push('\n');
-                    }
-                    combined.push_str(&stderr);
-                }
-                Ok((exit_code, combined))
-            } else {
-                // Poll with timeout
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            // Process finished
-                            let mut stdout_buf = Vec::new();
-                            let mut stderr_buf = Vec::new();
-                            use std::io::Read;
-                            if let Some(ref mut out) = child.stdout {
-                                let _ = out.read_to_end(&mut stdout_buf);
-                            }
-                            if let Some(ref mut err) = child.stderr {
-                                let _ = err.read_to_end(&mut stderr_buf);
-                            }
-                            let exit_code = status.code().unwrap_or(-1);
-                            let mut combined = String::from_utf8_lossy(&stdout_buf).to_string();
-                            let stderr = String::from_utf8_lossy(&stderr_buf);
-                            if !stderr.is_empty() {
-                                if !combined.is_empty() {
-                                    combined.push('\n');
-                                }
-                                combined.push_str(&stderr);
-                            }
-                            return Ok((exit_code, combined));
-                        }
-                        Ok(None) => {
-                            // Still running
-                            if std::time::Instant::now() >= deadline {
-                                let _ = child.kill();
-                                return Err(format!("Command timed out after {}s", timeout_secs));
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                        Err(e) => return Err(format!("Error waiting for process: {}", e)),
-                    }
-                }
-            }
-        });
-
-        match handle.join() {
-            Ok(Ok((code, output))) => {
-                let mut result = if output.len() > 10240 {
-                    format!("{}\n... (output truncated to 10KB)", &output[..10240])
-                } else {
-                    output
-                };
-                if code != 0 {
-                    result.push_str(&format!("\n[exit code: {}]", code));
-                }
-                result
-            }
-            Ok(Err(e)) => format!("Error: {}", e),
-            Err(_) => "Error: Command execution panicked".to_string(),
-        }
-    }
-
-    #[tool(description = "Link an environment to a project directory for context-aware activation")]
-    fn associate_project(&self, Parameters(params): Parameters<AssociateProjectParams>) -> String {
         let db = self.db.lock().unwrap();
         let ops =
             crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
-
-        match ops.associate_project(
-            &params.project_path,
-            &params.env_name,
-            params.tag.as_deref(),
-            params.is_default.unwrap_or(false),
-        ) {
-            Ok(msg) => msg,
-            Err(e) => format!("Error: {}", e),
-        }
-    }
-
-    #[tool(description = "Get the default environment for a project")]
-    fn get_default_environment(&self, Parameters(params): Parameters<ProjectPathParam>) -> String {
-        let db = self.db.lock().unwrap();
-        let ops =
-            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
-
-        match ops.get_default_env(&params.project_path) {
-            Ok(Some(env)) => format!("Default environment: {}", env),
-            Ok(None) => "No default environment set for this project".to_string(),
-            Err(e) => format!("Error: {}", e),
-        }
-    }
-
-    #[tool(description = "Get all environments associated with a project")]
-    fn get_project_environments(&self, Parameters(params): Parameters<ProjectPathParam>) -> String {
-        let db = self.db.lock().unwrap();
-        let ops =
-            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
-
-        match ops.get_project_envs(&params.project_path) {
-            Ok(envs) => {
-                let list: Vec<String> = envs
-                    .into_iter()
-                    .map(|(name, _path, tag, is_default)| {
-                        let tag_str = tag.map(|t| format!(" [{}]", t)).unwrap_or_default();
-                        let default = if is_default { " (DEFAULT)" } else { "" };
-                        format!("• {}{}{}", name, tag_str, default)
-                    })
-                    .collect();
-                if list.is_empty() {
-                    "No environments associated with this project".to_string()
-                } else {
-                    list.join("\n")
-                }
+        match ops.untrack_env(&name) {
+            Ok(msg) => {
+                crate::activity_log::log_activity("mcp", "rm:cached", name.as_str());
+                McpResponse::ok(ActionResult { message: msg })
             }
-            Err(e) => format!("Error: {}", e),
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(
-        description = "Get detailed information about an environment including Python version, packages, ML frameworks"
-    )]
-    fn get_environment_details(&self, Parameters(params): Parameters<EnvNameParam>) -> String {
+    // --- inspect_environment dispatches ---
+
+    fn do_get_details(&self, env_name: &EnvName) -> String {
         let db = self.db.lock().unwrap();
         let ops =
             crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
         match ops.list_envs() {
             Ok(envs) => {
-                let env = envs.iter().find(|(n, ..)| n == params.env_name.as_str());
+                let env = envs.iter().find(|(n, ..)| n == env_name.as_str());
                 match env {
                     Some((name, path, py_ver, ..)) => {
                         let packages = crate::utils::get_packages(path);
 
-                        let mut details = format!("# Environment: {}\n\n", name);
-                        details.push_str(&format!("**Python**: {}\n", py_ver));
-                        details.push_str(&format!("**Path**: {}\n", redact_path(path)));
-                        details.push_str(&format!("**Packages**: {}\n", packages.len()));
-                        if let Some(epoch) = crate::utils::get_env_created_at(path) {
+                        let created = crate::utils::get_env_created_at(path).and_then(|epoch| {
                             use chrono::{Local, TimeZone};
-                            if let Some(dt) = Local.timestamp_opt(epoch, 0).single() {
-                                details.push_str(&format!(
-                                    "**Created**: {}\n",
-                                    dt.format("%Y-%m-%d %H:%M")
-                                ));
-                            }
-                        }
-                        details.push('\n');
+                            Local
+                                .timestamp_opt(epoch, 0)
+                                .single()
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        });
 
-                        // Torch version from version.py (accurate CUDA suffix)
-                        if let Some((torch, cuda)) = crate::utils::read_torch_version(path) {
-                            details.push_str(&format!("**PyTorch**: {}\n", torch));
-                            if let Some(c) = cuda {
-                                details.push_str(&format!("**CUDA**: {}\n", c));
-                            }
-                        }
-                        // Other key packages from scan
-                        let get_ver = |name: &str| {
-                            packages
-                                .iter()
-                                .find(|p| p.name == name)
-                                .and_then(|p| p.version.clone())
-                        };
-                        if let Some(v) = get_ver("numpy") {
-                            details.push_str(&format!("**NumPy**: {}\n", v));
-                        }
-                        details
+                        let (torch, cuda) = crate::utils::read_torch_version(path)
+                            .map(|(t, c)| (Some(t), c))
+                            .unwrap_or((None, None));
+
+                        let numpy = packages
+                            .iter()
+                            .find(|p| p.name == "numpy")
+                            .and_then(|p| p.version.clone());
+
+                        McpResponse::ok(EnvDetails {
+                            name: name.clone(),
+                            python: py_ver.clone(),
+                            path: redact_path(path),
+                            packages: packages.len(),
+                            created,
+                            torch,
+                            cuda,
+                            numpy,
+                        })
                     }
-                    None => format!("Environment '{}' not found", params.env_name),
+                    None => mcp_not_found("Environment", env_name.as_str()),
                 }
             }
-            Err(e) => format!("Error: {}", e),
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(description = "Check environment health: package conflicts, outdated dependencies")]
-    fn get_environment_health(&self, Parameters(params): Parameters<EnvNameParam>) -> String {
+    fn do_get_health(&self, env_name: &EnvName) -> String {
         let db = self.db.lock().unwrap();
         let ops =
             crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
-        match ops.check_health(&params.env_name) {
-            Ok(report) => report.to_text(&params.env_name),
-            Err(e) => format!("Error: {}", e),
-        }
-    }
+        match ops.check_health(env_name) {
+            Ok(report) => {
+                let overall = report.overall();
+                let checks: Vec<HealthCheck> = report
+                    .items
+                    .iter()
+                    .map(|item| HealthCheck {
+                        check: item.message(),
+                        status: format!("{}", item.level()),
+                        message: item.message(),
+                    })
+                    .collect();
 
-    #[tool(description = "Compare multiple environments side-by-side")]
-    fn compare_environments(
-        &self,
-        Parameters(params): Parameters<CompareEnvironmentsParams>,
-    ) -> String {
-        let db = self.db.lock().unwrap();
-        let ops =
-            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
-
-        if params.env_names.len() < 2 {
-            return "At least two environment names are required".to_string();
-        }
-
-        match ops.list_envs() {
-            Ok(all_envs) => {
-                let mut comparison = format!("# Comparison: {}\n\n", params.env_names.join(" vs "));
-
-                // Collect package maps for each env
-                let mut env_packages: Vec<(
-                    String,
-                    String,
-                    std::collections::HashMap<String, String>,
-                )> = Vec::new();
-                for name in &params.env_names {
-                    let env = all_envs.iter().find(|(n, ..)| n == name);
-                    if let Some((_, path, py_ver, ..)) = env {
-                        let packages = crate::utils::get_packages(path);
-                        let pkg_map: std::collections::HashMap<String, String> = packages
-                            .into_iter()
-                            .map(|p| {
-                                (
-                                    p.name.to_lowercase(),
-                                    p.version.unwrap_or_else(|| "?".into()),
-                                )
-                            })
-                            .collect();
-                        comparison.push_str(&format!(
-                            "## {}\n- Python: {}\n- Packages: {}\n\n",
-                            name,
-                            py_ver,
-                            pkg_map.len()
-                        ));
-                        env_packages.push((name.clone(), py_ver.clone(), pkg_map));
-                    } else {
-                        comparison.push_str(&format!("## {}\n- Not found\n\n", name));
-                    }
-                }
-
-                // Deep diff between first two envs
-                if env_packages.len() >= 2 {
-                    let (ref n1, _, ref pkgs1) = env_packages[0];
-                    let (ref n2, _, ref pkgs2) = env_packages[1];
-
-                    // Common packages with different versions
-                    let mut diffs: Vec<(String, String, String)> = Vec::new();
-                    for (name, v1) in pkgs1 {
-                        if let Some(v2) = pkgs2.get(name)
-                            && v1 != v2
-                        {
-                            diffs.push((name.clone(), v1.clone(), v2.clone()));
-                        }
-                    }
-                    if !diffs.is_empty() {
-                        diffs.sort_by(|a, b| a.0.cmp(&b.0));
-                        comparison.push_str("## Version differences\n\n");
-                        comparison.push_str(&format!("| Package | {} | {} |\n", n1, n2));
-                        comparison.push_str("|---------|------|------|\n");
-                        for (name, v1, v2) in &diffs {
-                            comparison.push_str(&format!("| {} | {} | {} |\n", name, v1, v2));
-                        }
-                        comparison.push('\n');
-                    }
-
-                    // Only in env1
-                    let mut only1: Vec<String> = pkgs1
-                        .keys()
-                        .filter(|k| !pkgs2.contains_key(*k))
-                        .cloned()
-                        .collect();
-                    only1.sort();
-                    if !only1.is_empty() {
-                        comparison.push_str(&format!(
-                            "## Only in {}\n{}\n\n",
-                            n1,
-                            only1.join(", ")
-                        ));
-                    }
-
-                    // Only in env2
-                    let mut only2: Vec<String> = pkgs2
-                        .keys()
-                        .filter(|k| !pkgs1.contains_key(*k))
-                        .cloned()
-                        .collect();
-                    only2.sort();
-                    if !only2.is_empty() {
-                        comparison.push_str(&format!(
-                            "## Only in {}\n{}\n\n",
-                            n2,
-                            only2.join(", ")
-                        ));
-                    }
-                }
-
-                comparison
+                McpResponse::ok(HealthResponse {
+                    env_name: env_name.to_string(),
+                    overall: format!("{}", overall),
+                    checks,
+                })
             }
-            Err(e) => format!("Error: {}", e),
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(description = "Get notes attached to an environment (purpose, description, reminders)")]
-    fn get_environment_notes(&self, Parameters(params): Parameters<EnvNameParam>) -> String {
+    // --- find_package dispatches ---
+
+    fn do_get_package_details(&self, env_name: &EnvName, query: &str) -> String {
         let db = self.db.lock().unwrap();
-        let ops =
-            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
 
-        match ops.list_comments(None, Some(&params.env_name)) {
-            Ok(comments) => {
-                if comments.is_empty() {
-                    return format!("No notes for environment '{}'", params.env_name);
-                }
-                let mut output = format!("Notes for '{}':\n", params.env_name);
-                for (_uuid, _pp, _env, msg, _tag, ts) in comments {
-                    output.push_str(&format!("[{}] {}\n", ts, msg));
-                }
-                output
-            }
-            Err(e) => format!("Error: {}", e),
-        }
-    }
-
-    #[tool(description = "Add a note to an environment (purpose, description, reminder)")]
-    fn add_environment_note(
-        &self,
-        Parameters(params): Parameters<AddEnvironmentNoteParams>,
-    ) -> String {
-        let db = self.db.lock().unwrap();
-        let ops =
-            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
-
-        match ops.add_env_note(&params.env_name, &params.note) {
-            Ok(msg) => msg,
-            Err(e) => format!("Error: {}", e),
-        }
-    }
-
-    #[tool(
-        description = "Search for a package across all environments (substring match). For wildcards or version matching, use find_package instead."
-    )]
-    fn search_packages(&self, Parameters(params): Parameters<SearchPackagesParams>) -> String {
-        let db = self.db.lock().unwrap();
         match db.list_envs() {
             Ok(envs) => {
-                let mut results = Vec::new();
-                for (name, path, ..) in &envs {
-                    let packages = crate::utils::get_packages(path);
-                    for pkg in packages {
-                        if pkg
-                            .name
-                            .to_lowercase()
-                            .contains(&params.query.to_lowercase())
-                        {
-                            let ver = pkg.version.unwrap_or_else(|| "?".to_string());
-                            results.push(format!("• {} → {} ({})", name, pkg.name, ver));
+                let env = envs.iter().find(|(n, ..)| n == env_name.as_str());
+                match env {
+                    Some((name, path, ..)) => {
+                        let packages = crate::utils::get_packages(path);
+                        let pkg_lower = query.to_lowercase();
+                        let found = packages
+                            .into_iter()
+                            .find(|p| p.name.to_lowercase() == pkg_lower);
+
+                        match found {
+                            Some(pkg) => {
+                                let installed_at = pkg.installed_at.and_then(|epoch| {
+                                    use chrono::{Local, TimeZone};
+                                    Local
+                                        .timestamp_opt(epoch, 0)
+                                        .single()
+                                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                });
+
+                                McpResponse::ok(PackageDetails {
+                                    name: pkg.name,
+                                    env: name.clone(),
+                                    version: pkg.version.unwrap_or_else(|| "unknown".to_string()),
+                                    installer: pkg
+                                        .installer
+                                        .unwrap_or_else(|| "unknown".to_string()),
+                                    source: pkg
+                                        .install_source
+                                        .unwrap_or_else(|| "unknown".to_string()),
+                                    editable: pkg.is_editable,
+                                    url: pkg.source_url,
+                                    commit: pkg.commit_id,
+                                    import_name: pkg.import_name,
+                                    installed_at,
+                                })
+                            }
+                            None => mcp_not_found(
+                                "Package",
+                                &format!("{} in environment '{}'", query, name),
+                            ),
                         }
                     }
-                }
-                if results.is_empty() {
-                    format!("No packages matching '{}' found", params.query)
-                } else {
-                    format!(
-                        "Packages matching '{}':\n{}",
-                        params.query,
-                        results.join("\n")
-                    )
+                    None => mcp_not_found("Environment", env_name.as_str()),
                 }
             }
-            Err(e) => format!("Error: {}", e),
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(
-        description = "Find a package across all environments. Supports wildcards (*torch*) and version matching (torch==2.10). CUDA-aware: queries without +cuXXX match base version."
-    )]
-    fn find_package(&self, Parameters(params): Parameters<FindPackageParams>) -> String {
+    fn do_find_package_cross_env(&self, query: &str) -> String {
         let db = self.db.lock().unwrap();
 
-        // Split query into name and optional version at "=="
-        let (pkg_query, version_query) = if params.query.contains("==") {
-            let parts: Vec<&str> = params.query.split("==").collect();
+        let (pkg_query, version_query) = if query.contains("==") {
+            let parts: Vec<&str> = query.split("==").collect();
             (
                 parts[0].to_string(),
                 Some(parts.get(1).unwrap_or(&"").to_string()),
             )
         } else {
-            (params.query.clone(), None)
+            (query.to_string(), None)
         };
 
-        // Default to substring matching (strip any legacy glob chars)
-        // pip treats hyphens and underscores as equivalent
         let normalize = |s: &str| s.to_lowercase().replace('-', "_");
         let pattern = normalize(&pkg_query.replace('*', ""));
 
@@ -935,14 +1182,10 @@ impl ZenMcpServer {
                     let packages = crate::utils::get_packages(path);
                     for pkg in packages {
                         let pkg_norm = normalize(&pkg.name);
-
-                        // Substring match by default
                         let name_match = pkg_norm.contains(&pattern);
 
                         let version_match = match (&version_query, &pkg.version) {
                             (Some(q), Some(v)) => {
-                                // Version query with "+" requires exact match (e.g., "2.10.0+cu130")
-                                // Without "+", match base version before the CUDA suffix
                                 if q.contains('+') {
                                     v == q
                                 } else {
@@ -955,118 +1198,146 @@ impl ZenMcpServer {
                         };
 
                         if name_match && version_match {
-                            let ver = pkg.version.unwrap_or_else(|| "?".to_string());
-                            found.push(format!("• {} → {} ({})", name, pkg.name, ver));
+                            found.push(PackageMatch {
+                                env: name.clone(),
+                                package: pkg.name,
+                                version: pkg.version.unwrap_or_else(|| "?".to_string()),
+                            });
                         }
                     }
                 }
-                if found.is_empty() {
-                    format!("No packages matching '{}' found", params.query)
-                } else {
-                    format!(
-                        "Found {} match(es) for '{}':\n{}",
-                        found.len(),
-                        params.query,
-                        found.join("\n")
-                    )
-                }
+                McpResponse::ok(found)
             }
-            Err(e) => format!("Error: {}", e),
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(
-        description = "Get detailed info about a specific package in an environment: version, installer (pip/uv), source (pypi/git/local), editable status, source URL, git commit. Similar to pip show."
-    )]
-    fn get_package_details(&self, Parameters(params): Parameters<PackageDetailsParams>) -> String {
-        let db = self.db.lock().unwrap();
+    // --- manage_project dispatches ---
 
-        match db.list_envs() {
+    fn do_associate_project(&self, params: ManageProjectParams) -> String {
+        let env_name = match params.env_name {
+            Some(n) => n,
+            None => return mcp_invalid("'env_name' is required for action 'link'"),
+        };
+        let db = self.db.lock().unwrap();
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
+
+        match ops.associate_project(
+            &params.project_path,
+            &env_name,
+            params.tag.as_deref(),
+            params.is_default.unwrap_or(false),
+        ) {
+            Ok(msg) => McpResponse::ok(ActionResult { message: msg }),
+            Err(e) => mcp_sys_err(e),
+        }
+    }
+
+    fn do_get_default_environment(&self, project_path: &str) -> String {
+        let db = self.db.lock().unwrap();
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
+
+        match ops.get_default_env(project_path) {
+            Ok(Some(env)) => McpResponse::ok(ActionResult { message: env }),
+            Ok(None) => McpResponse::ok(ActionResult {
+                message: "No default environment set".to_string(),
+            }),
+            Err(e) => mcp_sys_err(e),
+        }
+    }
+
+    fn do_get_project_environments(&self, project_path: &str) -> String {
+        let db = self.db.lock().unwrap();
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
+
+        match ops.get_project_envs(project_path) {
             Ok(envs) => {
-                let env = envs.iter().find(|(n, ..)| n == params.env_name.as_str());
-                match env {
-                    Some((name, path, ..)) => {
-                        // Full package scan: METADATA + INSTALLER + direct_url.json
-                        let packages = crate::utils::get_packages(path);
-                        let pkg_lower = params.package.to_lowercase();
-                        let found = packages
-                            .into_iter()
-                            .find(|p| p.name.to_lowercase() == pkg_lower);
-
-                        match found {
-                            Some(pkg) => {
-                                let mut details = format!("# {} in '{}'\n\n", pkg.name, name);
-                                details.push_str(&format!(
-                                    "**Version**: {}\n",
-                                    pkg.version.as_deref().unwrap_or("unknown")
-                                ));
-                                details.push_str(&format!(
-                                    "**Installer**: {}\n",
-                                    pkg.installer.as_deref().unwrap_or("unknown")
-                                ));
-                                details.push_str(&format!(
-                                    "**Source**: {}\n",
-                                    pkg.install_source.as_deref().unwrap_or("unknown")
-                                ));
-                                details.push_str(&format!(
-                                    "**Editable**: {}\n",
-                                    if pkg.is_editable { "yes" } else { "no" }
-                                ));
-                                if let Some(url) = &pkg.source_url {
-                                    details.push_str(&format!("**URL**: {}\n", url));
-                                }
-                                if let Some(commit) = &pkg.commit_id {
-                                    details.push_str(&format!("**Commit**: {}\n", commit));
-                                }
-                                // Import name: only show when pip name is NOT in top_level.txt
-                                if let Some(ref import) = pkg.import_name {
-                                    details.push_str(&format!("**Import**: `{}`\n", import));
-                                }
-                                if let Some(epoch) = pkg.installed_at {
-                                    use chrono::{Local, TimeZone};
-                                    if let Some(dt) = Local.timestamp_opt(epoch, 0).single() {
-                                        details.push_str(&format!(
-                                            "**Installed**: {}\n",
-                                            dt.format("%Y-%m-%d %H:%M")
-                                        ));
-                                    }
-                                }
-                                details
-                            }
-                            None => format!(
-                                "Package '{}' not found in environment '{}'",
-                                params.package, name
-                            ),
-                        }
-                    }
-                    None => format!("Environment '{}' not found", params.env_name),
-                }
+                let links: Vec<ProjectLink> = envs
+                    .into_iter()
+                    .map(|(name, _path, tag, is_default)| ProjectLink {
+                        env: name,
+                        tag,
+                        is_default,
+                    })
+                    .collect();
+                McpResponse::ok(links)
             }
-            Err(e) => format!("Error: {}", e),
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(description = "Add a label to an environment (e.g., ml, dev, testing)")]
-    fn add_label(&self, Parameters(params): Parameters<LabelParams>) -> String {
+    // --- manage_metadata dispatches ---
+
+    fn do_add_note(&self, env_name: &EnvName, note: Option<&str>) -> String {
+        let note = match note {
+            Some(n) => n,
+            None => return mcp_invalid("'note' is required for action 'add_note'"),
+        };
         let db = self.db.lock().unwrap();
-        match db.add_label(&params.env_name, &params.label) {
-            Ok(_) => format!("Added label '{}' to '{}'", params.label, params.env_name),
-            Err(e) => format!("Error: {}", e),
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
+
+        match ops.add_env_note(env_name, note) {
+            Ok(msg) => McpResponse::ok(ActionResult { message: msg }),
+            Err(e) => mcp_sys_err(e),
         }
     }
 
-    #[tool(description = "Remove a label from an environment")]
-    fn remove_label(&self, Parameters(params): Parameters<LabelParams>) -> String {
+    fn do_get_notes(&self, env_name: &EnvName) -> String {
         let db = self.db.lock().unwrap();
-        match db.remove_label(&params.env_name, &params.label) {
-            Ok(_) => format!(
-                "Removed label '{}' from '{}'",
-                params.label, params.env_name
-            ),
-            Err(e) => format!("Error: {}", e),
+        let ops =
+            crate::ops::ZenOps::new(&db, self.home.clone(), crate::context::OutputMode::Plain);
+
+        match ops.list_comments(None, Some(env_name)) {
+            Ok(comments) => {
+                let notes: Vec<NoteEntry> = comments
+                    .into_iter()
+                    .map(|(_uuid, _pp, _env, msg, _tag, ts)| NoteEntry {
+                        timestamp: ts,
+                        text: msg,
+                    })
+                    .collect();
+                McpResponse::ok(notes)
+            }
+            Err(e) => mcp_sys_err(e),
+        }
+    }
+
+    fn do_add_label(&self, env_name: &EnvName, label: Option<&str>) -> String {
+        let label = match label {
+            Some(l) => l,
+            None => return mcp_invalid("'label' is required for action 'add_label'"),
+        };
+        let db = self.db.lock().unwrap();
+        match db.add_label(env_name, label) {
+            Ok(_) => McpResponse::ok(ActionResult {
+                message: format!("Added label '{}' to '{}'", label, env_name),
+            }),
+            Err(e) => mcp_sys_err(e),
+        }
+    }
+
+    fn do_remove_label(&self, env_name: &EnvName, label: Option<&str>) -> String {
+        let label = match label {
+            Some(l) => l,
+            None => return mcp_invalid("'label' is required for action 'remove_label'"),
+        };
+        let db = self.db.lock().unwrap();
+        match db.remove_label(env_name, label) {
+            Ok(_) => McpResponse::ok(ActionResult {
+                message: format!("Removed label '{}' from '{}'", label, env_name),
+            }),
+            Err(e) => mcp_sys_err(e),
         }
     }
 }
+
+// =============================================================================
+// SERVER HANDLER
+// =============================================================================
 
 #[rmcp::tool_handler]
 impl ServerHandler for ZenMcpServer {

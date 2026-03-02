@@ -8,6 +8,7 @@ pub mod db;
 pub mod error;
 pub mod hooks;
 pub mod ops;
+pub mod output;
 pub mod repl;
 pub mod table;
 pub mod types;

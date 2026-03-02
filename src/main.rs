@@ -9,6 +9,7 @@ mod error;
 mod hooks;
 mod mcp;
 mod ops;
+mod output;
 mod repl;
 mod table;
 mod types;
@@ -128,6 +129,9 @@ enum Commands {
         /// Long format with paths (like ls -l)
         #[arg(short = 'l')]
         long_format: bool,
+        /// Output as JSON (machine-readable)
+        #[arg(long)]
+        json: bool,
     },
     /// Remove an environment from the database and disk
     Rm {
@@ -204,6 +208,9 @@ enum Commands {
     Info {
         /// Name of the environment (inferred from $VIRTUAL_ENV if omitted)
         name: Option<String>,
+        /// Output as JSON (machine-readable)
+        #[arg(long)]
+        json: bool,
     },
     /// Show system status and active environment
     Status,
@@ -329,6 +336,9 @@ enum Commands {
     Health {
         /// Name of the environment (inferred from $VIRTUAL_ENV if omitted)
         name: Option<String>,
+        /// Auto-fix missing dependencies
+        #[arg(long)]
+        fix: bool,
     },
     /// View the activity log (recent operations)
     #[command(alias = "logs")]
@@ -486,8 +496,13 @@ enum TemplateCommands {
         /// Optional template name to inspect
         name: Option<String>,
     },
-    /// Remove a template
-    Rm { name: String },
+    Rm {
+        /// Template name (or omit with --all)
+        name: Option<String>,
+        /// Remove all templates
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+    },
     /// Update unpinned dependencies for a template
     Update { name: String },
     /// Inspect template contents (Docker-style layered view)
@@ -806,6 +821,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format,
                 oneline,
                 long_format,
+                json,
             } => {
                 let sort_str = match sort {
                     ListSort::Name => "name",
@@ -834,6 +850,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     list_format,
                     oneline,
                     long_format,
+                    json,
                 )?;
             }
             Commands::Rm { name, yes, cached } => {
@@ -861,8 +878,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TemplateCommands::List { name } => {
                     commands::template::run_list(&db, name)?;
                 }
-                TemplateCommands::Rm { name } => {
-                    commands::template::run_rm(&db, &name)?;
+                TemplateCommands::Rm { name, all } => {
+                    if all {
+                        commands::template::run_rm_all(&db)?;
+                    } else if let Some(name) = name {
+                        commands::template::run_rm(&db, &name)?;
+                    } else {
+                        eprintln!("Usage: zen template rm <name> or zen template rm --all");
+                        std::process::exit(1);
+                    }
                 }
                 TemplateCommands::Update { name: _ } => {
                     println!("Template update is not yet implemented.");
@@ -939,9 +963,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 commands::uninstall::run(&ops, &db, &env_name, packages)?;
             }
-            Commands::Info { name } => {
+            Commands::Info { name, json } => {
                 let name = resolve_env_name(name, &db)?;
-                commands::info::run(&ops, &name)?;
+                commands::info::run(&ops, &name, json)?;
             }
             Commands::Status => {
                 let db_path = cli.db_path.clone().unwrap_or_else(|| {
@@ -1022,10 +1046,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 commands::diff::run(&db, &env1, &env2, only_diff)?;
             }
-            Commands::Health { name } => {
+            Commands::Health { name, fix } => {
                 let name = resolve_env_name(name, &db)?;
                 let env_name = types::EnvName::new(&name).map_err(|e| e.to_string())?;
-                commands::health::run(&ops, &env_name)?;
+                commands::health::run(&ops, &env_name, fix)?;
             }
             Commands::Activate {
                 name,

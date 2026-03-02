@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Activity log — bash-history-style append-only audit trail.
 //!
 //! Log file: `~/.config/zen/zen.log`

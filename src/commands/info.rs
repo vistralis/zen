@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::ops::ZenOps;
+use crate::output::EnvDetails;
 use crate::types::HealthLevel;
 use crate::utils;
 use colored::*;
@@ -8,32 +9,35 @@ use owo_colors::OwoColorize;
 use std::error::Error;
 
 /// Runs the `zen info <name>` command.
-pub fn run(ops: &ZenOps, name: &str) -> Result<(), Box<dyn Error>> {
+pub fn run(ops: &ZenOps, name: &str, json: bool) -> Result<(), Box<dyn Error>> {
     let envs = ops.list_envs_with_status(None, None, None)?;
     let env = envs.iter().find(|(n, ..)| n == name);
 
     if let Some((_, path, _, exists, ..)) = env {
         if !exists {
-            println!(
-                "Environment: {} (MISSING on filesystem)",
-                name.magenta().bold()
-            );
+            if json {
+                let details = EnvDetails {
+                    name: name.to_string(),
+                    python: "missing".to_string(),
+                    path: path.clone(),
+                    packages: 0,
+                    created: None,
+                    torch: None,
+                    cuda: None,
+                    numpy: None,
+                };
+                println!("{}", serde_json::to_string_pretty(&details)?);
+            } else {
+                println!(
+                    "Environment: {} (MISSING on filesystem)",
+                    name.magenta().bold()
+                );
+            }
         } else {
             let py_ver = utils::read_python_version(path).unwrap_or_else(|| "unknown".to_string());
-            println!(
-                "{}  {}",
-                "Environment:".bold(),
-                name.truecolor(100, 200, 255)
-            );
-            println!("{}       {}", "Path:".bold(), path.dimmed());
-            println!("{}     {}", "Python:".bold(), py_ver);
-
-            // Torch version from version.py (accurate CUDA suffix)
             let (torch_ver, cuda_ver) = utils::read_torch_version(path)
                 .map(|(t, c)| (Some(t), c))
                 .unwrap_or((None, None));
-
-            // All packages from scan
             let packages = utils::get_packages(path);
             let get_ver = |pkg_name: &str| {
                 packages
@@ -41,6 +45,29 @@ pub fn run(ops: &ZenOps, name: &str) -> Result<(), Box<dyn Error>> {
                     .find(|p| p.name == pkg_name)
                     .and_then(|p| p.version.clone())
             };
+
+            if json {
+                let details = EnvDetails {
+                    name: name.to_string(),
+                    python: py_ver,
+                    path: path.clone(),
+                    packages: packages.len(),
+                    created: None,
+                    torch: torch_ver,
+                    cuda: cuda_ver,
+                    numpy: get_ver("numpy"),
+                };
+                println!("{}", serde_json::to_string_pretty(&details)?);
+                return Ok(());
+            }
+
+            println!(
+                "{}  {}",
+                "Environment:".bold(),
+                name.truecolor(100, 200, 255)
+            );
+            println!("{}       {}", "Path:".bold(), path.dimmed());
+            println!("{}     {}", "Python:".bold(), py_ver);
 
             // NumPy with version coloring
             if let Some(np_ver) = get_ver("numpy") {

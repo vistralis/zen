@@ -2,6 +2,7 @@
 
 use crate::db::Database;
 use crate::ops::ZenOps;
+use crate::output::EnvSummary;
 use crate::utils;
 use colored::*;
 use owo_colors::OwoColorize;
@@ -27,8 +28,10 @@ pub fn run(
     format: ListFormat,
     oneline: bool,
     long_format: bool,
+    json: bool,
 ) -> Result<(), Box<dyn Error>> {
     // Auto-discover new environments (silent, fast)
+    let mut collisions: Vec<String> = Vec::new();
     if home.exists()
         && let Ok(entries) = std::fs::read_dir(home)
     {
@@ -43,6 +46,16 @@ pub fn run(
                     let py_ver = utils::read_python_version(&path_str)
                         .unwrap_or_else(|| "unknown".to_string());
                     db.register_env(&name, &path_str, &py_ver)?;
+                } else if let Ok(Some(existing_path)) = db.get_env_path(&name) {
+                    // Name collision: ZEN_HOME dir blocked by existing alias
+                    if !existing_path.starts_with(home.to_string_lossy().as_ref()) {
+                        collisions.push(format!(
+                            "{} Name collision: '{}' exists in ZEN_HOME but alias is tracked → {}",
+                            "⚠".truecolor(255, 140, 0),
+                            name,
+                            existing_path
+                        ));
+                    }
                 }
             }
         }
@@ -64,6 +77,20 @@ pub fn run(
         for (name, ..) in &envs {
             println!("{}", name);
         }
+        return Ok(());
+    }
+
+    // Handle --json — machine-readable output, then exit
+    if json {
+        let summaries: Vec<EnvSummary> = envs
+            .iter()
+            .map(|(name, path, py_ver, ..)| EnvSummary {
+                name: name.clone(),
+                python: py_ver.clone(),
+                path: path.clone(),
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&summaries)?);
         return Ok(());
     }
 
@@ -99,10 +126,10 @@ pub fn run(
 
     match format {
         ListFormat::Minimal => {
-            render_minimal(&env_data, &tracked_keys, long_format);
+            render_minimal(&env_data, &tracked_keys, long_format, home);
         }
         ListFormat::Compact => {
-            render_compact(&env_data, &tracked_keys);
+            render_compact(&env_data, &tracked_keys, home);
         }
         ListFormat::Wide => {
             render_wide(&env_data, &tracked_keys);
@@ -111,6 +138,11 @@ pub fn run(
 
     // Legend footer with health counts
     render_footer(&env_data);
+
+    // Print collision warnings after the table + footer
+    for warning in &collisions {
+        eprintln!("{}", warning);
+    }
 
     Ok(())
 }
@@ -127,6 +159,7 @@ fn render_minimal(
     )],
     tracked_keys: &[&str],
     long_format: bool,
+    home: &std::path::Path,
 ) {
     // Pre-calculate all column widths
     let max_name = env_data
@@ -206,18 +239,28 @@ fn render_minimal(
             }
         }
 
-        let path_str = if long_format {
-            format!("  {}", path.dimmed())
+        let home_prefix = home.to_string_lossy();
+        let is_tracked = !path.starts_with(home_prefix.as_ref());
+
+        // For tracked envs, show path in the stack area instead of empty columns
+        let tracked_icon = if is_tracked {
+            format!(" {}", "↗".truecolor(180, 130, 255))
         } else {
             String::new()
         };
+        let (display_stack, display_path) = if long_format {
+            (stack_str, format!("  {}", path.dimmed()))
+        } else {
+            (stack_str, String::new())
+        };
         println!(
-            "{:<name_w$} {:<py_w$}{}{}{}",
+            "{:<name_w$} {:<py_w$}{}{}{}{}",
             name_display,
             py_ver.dimmed(),
             status_str,
-            stack_str,
-            path_str,
+            display_stack,
+            display_path,
+            tracked_icon,
             name_w = max_name + 2,
             py_w = max_pyver,
         );
@@ -235,6 +278,7 @@ fn render_compact(
         crate::types::HealthLevel,
     )],
     tracked_keys: &[&str],
+    home: &std::path::Path,
 ) {
     use comfy_table::modifiers::UTF8_ROUND_CORNERS;
     use comfy_table::presets::UTF8_FULL;
@@ -263,9 +307,17 @@ fn render_compact(
     }
     table.set_header(header_row);
 
-    for (name, _path, py_ver, _exists, is_fav, versions, health) in env_data {
+    for (name, path, py_ver, _exists, is_fav, versions, health) in env_data {
+        let home_prefix = home.to_string_lossy();
+        let is_tracked = !path.starts_with(home_prefix.as_ref());
         let name_display = if *is_fav {
             format!("★ {}", name)
+        } else if is_tracked {
+            let folder = std::path::Path::new(path.as_str())
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            format!("{} → {}", name, folder)
         } else {
             name.clone()
         };

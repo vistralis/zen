@@ -99,6 +99,7 @@ pub fn run(
                     name.truecolor(100, 200, 255).bold(),
                     sorted.len()
                 );
+                println!("  {}", path.dimmed());
                 println!();
                 let max_name = sorted.iter().map(|p| p.name.len()).max().unwrap_or(20);
                 let max_ver = sorted
@@ -144,6 +145,7 @@ pub fn run(
                     name.truecolor(100, 200, 255).bold(),
                     sorted.len()
                 );
+                println!("  {}", path.dimmed());
                 println!();
                 let term_width = terminal_size::terminal_size()
                     .map(|(terminal_size::Width(w), _)| w as usize)

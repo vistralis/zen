@@ -601,29 +601,6 @@ impl<'a> ZenOps<'a> {
         ))
     }
 
-    /// Generates a full summary of the system state for AI context.
-    #[allow(dead_code)]
-    pub fn get_system_summary(&self) -> Result<String, Box<dyn Error>> {
-        let envs = self.db.list_envs()?;
-        let mut out = format!("Zen v{}\n", env!("CARGO_PKG_VERSION"));
-        out.push_str(&format!("Registered environments: {}\n", envs.len()));
-
-        for (name, path, py_ver, ..) in &envs {
-            let pkg_count = utils::get_packages(path).len();
-            out.push_str(&format!(
-                "  {} — py {} ({} pkgs)\n",
-                name, py_ver, pkg_count
-            ));
-        }
-
-        // Active env from VIRTUAL_ENV
-        if let Some(venv) = utils::get_current_venv_path() {
-            out.push_str(&format!("Active: {}\n", venv));
-        }
-
-        Ok(out)
-    }
-
     /// Runs a full health check on an environment.
     ///
     /// Checks: python binary, site-packages, CUDA consistency, dependency conflicts.

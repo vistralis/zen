@@ -451,10 +451,12 @@ fn marker_excludes_python(marker: &str, env_py_version: &str) -> bool {
 /// Evaluate a single python_version comparison clause.
 /// e.g., `python_version < "3.11"` or `python_full_version >= "3.9.0"`
 fn eval_single_python_marker(clause: &str, env_py_version: &str) -> bool {
-    // Extract operator and version value
+    use pep440_rs::{Version, VersionSpecifiers};
+    use std::str::FromStr;
+
     let clause = clause.trim().trim_start_matches('(').trim_end_matches(')');
 
-    // Find the operator
+    // Find the operator and version string
     let (op, ver_str) = if let Some(pos) = clause.find(">=") {
         (">=", &clause[pos + 2..])
     } else if let Some(pos) = clause.find("<=") {
@@ -471,24 +473,20 @@ fn eval_single_python_marker(clause: &str, env_py_version: &str) -> bool {
         return true; // Can't parse → assume true (include dep)
     };
 
-    // Extract version string from quotes
-    let ver_str = ver_str.trim();
-    let ver_str = ver_str.trim_matches('"').trim_matches('\'').trim();
+    let ver_str = ver_str.trim().trim_matches('"').trim_matches('\'').trim();
     if ver_str.is_empty() {
         return true;
     }
 
-    let cmp = compare_versions(env_py_version, ver_str);
-
-    match op {
-        ">=" => cmp >= 0,
-        "<=" => cmp <= 0,
-        ">" => cmp > 0,
-        "<" => cmp < 0,
-        "==" => cmp == 0,
-        "!=" => cmp != 0,
-        _ => true,
-    }
+    // Build a PEP 440 specifier and compare
+    let specifier_str = format!("{}{}", op, ver_str);
+    let Ok(specifiers) = VersionSpecifiers::from_str(&specifier_str) else {
+        return true; // Can't parse → assume satisfied
+    };
+    let Ok(version) = Version::from_str(env_py_version) else {
+        return true;
+    };
+    specifiers.contains(&version)
 }
 /// Handles formats: "name (>=1.0,<2.0)", "name>=1.0", "name[extra]>=1.0", "name"
 fn parse_requirement_name_and_spec(req: &str) -> (String, String) {
@@ -522,116 +520,24 @@ fn parse_requirement_name_and_spec(req: &str) -> (String, String) {
     }
 }
 
-/// Strip PEP 440 local version suffix (+cuXXX, +cpu, etc.) for comparison.
-fn strip_local_version(version: &str) -> &str {
-    version.split('+').next().unwrap_or(version)
-}
-
 /// Check if an installed version satisfies a specifier string like ">=1.0,<2.0,!=1.5".
 ///
-/// Supports: >=, <=, >, <, ==, !=, ~=
-/// Strips local version suffixes (+cuXXX) before comparison.
+/// Uses `pep440_rs` for correct PEP 440 semantics including:
+/// - Pre/post/dev releases (e.g., 0.1.8.post2, 2.11.0.dev20260129)
+/// - Local version identifiers (+cuXXX, +cpu) — fully supported per PEP 440
+/// - Wildcard matching (==1.*)
+/// - Compatible release (~=1.4)
 fn version_satisfies_specifier(installed: &str, specifier: &str) -> bool {
-    let installed_clean = strip_local_version(installed);
+    use pep440_rs::{Version, VersionSpecifiers};
+    use std::str::FromStr;
 
-    for constraint in specifier.split(',') {
-        let constraint = constraint.trim();
-        if constraint.is_empty() {
-            continue;
-        }
-
-        let (op, ver_str) = if let Some(rest) = constraint.strip_prefix("~=") {
-            ("~=", rest.trim())
-        } else if let Some(rest) = constraint.strip_prefix(">=") {
-            (">=", rest.trim())
-        } else if let Some(rest) = constraint.strip_prefix("<=") {
-            ("<=", rest.trim())
-        } else if let Some(rest) = constraint.strip_prefix("!=") {
-            ("!=", rest.trim())
-        } else if let Some(rest) = constraint.strip_prefix("==") {
-            ("==", rest.trim())
-        } else if let Some(rest) = constraint.strip_prefix('>') {
-            (">", rest.trim())
-        } else if let Some(rest) = constraint.strip_prefix('<') {
-            ("<", rest.trim())
-        } else {
-            continue;
-        };
-
-        let req_clean = strip_local_version(ver_str);
-        // Handle wildcard == (e.g., "==1.*")
-        if op == "==" && req_clean.ends_with(".*") {
-            let prefix = &req_clean[..req_clean.len() - 2];
-            if !installed_clean.starts_with(prefix)
-                && !installed_clean.starts_with(&format!("{}.", prefix))
-                && installed_clean != prefix
-            {
-                return false;
-            }
-            continue;
-        }
-
-        let cmp = compare_versions(installed_clean, req_clean);
-
-        let satisfied = match op {
-            ">=" => cmp >= 0,
-            "<=" => cmp <= 0,
-            ">" => cmp > 0,
-            "<" => cmp < 0,
-            "==" => cmp == 0,
-            "!=" => cmp != 0,
-            "~=" => {
-                // Compatible release: ~=X.Y means >=X.Y, <(X+1).0
-                cmp >= 0 && {
-                    let parts: Vec<&str> = req_clean.split('.').collect();
-                    if parts.len() >= 2 {
-                        let major = parts[..parts.len() - 1].join(".");
-                        installed_clean.starts_with(&major)
-                            || installed_clean.starts_with(&format!("{}.", major))
-                    } else {
-                        true
-                    }
-                }
-            }
-            _ => true,
-        };
-
-        if !satisfied {
-            return false;
-        }
-    }
-
-    true
-}
-
-/// Compare two version strings numerically segment by segment.
-/// Returns -1, 0, or 1 like strcmp.
-fn compare_versions(a: &str, b: &str) -> i32 {
-    let parse_num = |s: &str| -> u64 {
-        s.chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse::<u64>()
-            .unwrap_or(0)
+    let Ok(specifiers) = VersionSpecifiers::from_str(specifier) else {
+        return true; // Can't parse specifier → assume satisfied
     };
-
-    let parts_a: Vec<&str> = a.split('.').collect();
-    let parts_b: Vec<&str> = b.split('.').collect();
-    let max_len = parts_a.len().max(parts_b.len());
-
-    for i in 0..max_len {
-        let va = parts_a.get(i).map(|s| parse_num(s)).unwrap_or(0);
-        let vb = parts_b.get(i).map(|s| parse_num(s)).unwrap_or(0);
-
-        if va < vb {
-            return -1;
-        }
-        if va > vb {
-            return 1;
-        }
-    }
-
-    0
+    let Ok(version) = Version::from_str(installed) else {
+        return true; // Can't parse installed version → assume satisfied
+    };
+    specifiers.contains(&version)
 }
 
 /// Locate site-packages for an environment.
@@ -757,7 +663,6 @@ pub fn run_in_env_silent(env_path: impl AsRef<Path>, cmd: &str, args: &[&str]) -
 }
 
 /// Like `run_in_env_silent`, but returns captured (success, stdout, stderr).
-#[allow(dead_code)]
 pub fn run_in_env_capture(
     env_path: impl AsRef<Path>,
     cmd: &str,
@@ -805,7 +710,7 @@ pub fn parse_template_string(template_str: &str) -> Vec<TemplatePart> {
         .map(|part| {
             let mut subparts = part.splitn(2, ':');
             let name = subparts.next().unwrap_or_default().to_string();
-            let version = subparts.next().unwrap_or("latest").to_string();
+            let version = subparts.next().unwrap_or("default").to_string();
             TemplatePart { name, version }
         })
         .collect()

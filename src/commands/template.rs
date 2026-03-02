@@ -35,16 +35,21 @@ pub fn template_repl(
     let mut rl = rustyline::DefaultEditor::new()?;
     let _ = rl.load_history(&history_path);
 
-    // Pre-seed with bash history
+    // Pre-seed with install commands from bash history
     if let Ok(home) = std::env::var("HOME") {
         let bash_hist = std::path::PathBuf::from(&home).join(".bash_history");
         if let Ok(contents) = std::fs::read_to_string(&bash_hist) {
-            let keywords = ["pip", "zen", "uv", "conda"];
+            let install_patterns = [
+                "pip install",
+                "uv pip install",
+                "zen install",
+                "conda install",
+            ];
             for line in contents.lines() {
                 let line = line.trim();
                 if !line.is_empty()
                     && !line.starts_with('#')
-                    && keywords.iter().any(|k| line.contains(k))
+                    && install_patterns.iter().any(|p| line.contains(p))
                 {
                     let _ = rl.add_history_entry(line);
                 }
@@ -167,7 +172,7 @@ pub fn run_create(
 
     let mut parts = name.splitn(2, ':');
     let t_name = parts.next().unwrap();
-    let t_ver = parts.next().unwrap_or("latest");
+    let t_ver = parts.next().unwrap_or("default");
 
     let (temp_id, is_new) = db.create_template(t_name, t_ver, &python)?;
     let tmp_env = std::env::temp_dir().join(format!("zen_tpl_{}_{}", t_name, t_ver));
@@ -296,11 +301,41 @@ pub fn run_list(db: &Database, name: Option<String>) -> Result<(), Box<dyn Error
 }
 
 pub fn run_rm(db: &Database, name: &str) -> Result<(), Box<dyn Error>> {
-    if db.delete_template(name)? {
-        activity_log::log_activity("cli", "template:rm", name);
-        println!("{} Template '{}' deleted.", "✓".green(), name);
+    let mut parts = name.splitn(2, ':');
+    let t_name = parts.next().unwrap();
+    let t_ver = parts.next();
+
+    if let Some(ver) = t_ver {
+        // Specific version: zen template rm numpy:1
+        match db.get_template_id(t_name, ver)? {
+            Some(id) => {
+                db.delete_template_by_id(id)?;
+                activity_log::log_activity("cli", "template:rm", &format!("{}:{}", t_name, ver));
+                println!("{} Template '{}:{}' deleted.", "✓".green(), t_name, ver);
+            }
+            None => {
+                println!("{} Template '{}:{}' not found.", "✗".red(), t_name, ver);
+            }
+        }
     } else {
-        println!("{} Template '{}' not found.", "✗".red(), name);
+        // No version: zen template rm numpy (deletes all versions)
+        if db.delete_template(t_name)? {
+            activity_log::log_activity("cli", "template:rm", t_name);
+            println!("{} Template '{}' deleted.", "✓".green(), t_name);
+        } else {
+            println!("{} Template '{}' not found.", "✗".red(), t_name);
+        }
+    }
+    Ok(())
+}
+
+pub fn run_rm_all(db: &Database) -> Result<(), Box<dyn Error>> {
+    let count = db.delete_all_templates()?;
+    if count > 0 {
+        activity_log::log_activity("cli", "template:rm:all", &format!("{} templates", count));
+        println!("{} Deleted all templates ({} removed).", "✓".green(), count);
+    } else {
+        println!("No templates to delete.");
     }
     Ok(())
 }
@@ -308,7 +343,7 @@ pub fn run_rm(db: &Database, name: &str) -> Result<(), Box<dyn Error>> {
 pub fn run_inspect(db: &Database, name: &str) -> Result<(), Box<dyn Error>> {
     let mut parts = name.splitn(2, ':');
     let t_name = parts.next().unwrap();
-    let t_ver = parts.next().unwrap_or("latest");
+    let t_ver = parts.next().unwrap_or("default");
 
     let t_id = db.get_template_id(t_name, t_ver)?;
     match t_id {
@@ -408,7 +443,7 @@ pub fn run_edit(
 ) -> Result<(), Box<dyn Error>> {
     let mut parts = name.splitn(2, ':');
     let t_name = parts.next().unwrap();
-    let t_ver = parts.next().unwrap_or("latest");
+    let t_ver = parts.next().unwrap_or("default");
 
     let t_id = match db.get_template_id(t_name, t_ver)? {
         Some(id) => id,
@@ -495,7 +530,7 @@ pub fn run_edit(
                 } else {
                     (
                         pkg_name.clone(),
-                        "latest".to_string(),
+                        "default".to_string(),
                         "pypi",
                         install_args.clone(),
                     )
@@ -696,7 +731,7 @@ pub fn run_export_tpl(
 ) -> Result<(), Box<dyn Error>> {
     let mut parts = name.splitn(2, ':');
     let t_name = parts.next().unwrap();
-    let t_ver = parts.next().unwrap_or("latest");
+    let t_ver = parts.next().unwrap_or("default");
 
     let t_id = match db.get_template_id(t_name, t_ver)? {
         Some(id) => id,
@@ -822,7 +857,7 @@ pub fn run_import_tpl(db: &Database, file: &str) -> Result<(), Box<dyn Error>> {
     let t_ver = tpl
         .get("version")
         .and_then(|v: &toml::Value| v.as_str())
-        .unwrap_or("latest");
+        .unwrap_or("default");
     let py_ver = tpl
         .get("python")
         .and_then(|v: &toml::Value| v.as_str())
@@ -875,7 +910,7 @@ pub fn run_import_tpl(db: &Database, file: &str) -> Result<(), Box<dyn Error>> {
                 let version = pkg_tbl
                     .get("version")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("latest");
+                    .unwrap_or("default");
                 let itype = pkg_tbl
                     .get("type")
                     .and_then(|v| v.as_str())

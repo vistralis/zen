@@ -215,18 +215,6 @@ impl fmt::Display for HealthLevel {
     }
 }
 
-impl HealthLevel {
-    /// The icon for this severity level.
-    pub fn icon(&self) -> &'static str {
-        match self {
-            Self::Pass => "✓",
-            Self::Info => "~",
-            Self::Warn => "⚠",
-            Self::Fail => "✗",
-        }
-    }
-}
-
 // =============================================================================
 // HealthDiagnostic — typed health check results
 // =============================================================================
@@ -337,16 +325,6 @@ impl HealthReport {
             .map(|d| d.level())
             .max()
             .unwrap_or(HealthLevel::Pass)
-    }
-
-    /// Format as plain text for MCP/programmatic use.
-    pub fn to_text(&self, env_name: &str) -> String {
-        let mut out = format!("Health: {}\n", env_name);
-        for item in &self.items {
-            out.push_str(&format!("{} {}\n", item.level().icon(), item.message()));
-        }
-        out.push_str(&format!("\nOverall: {}", self.overall()));
-        out
     }
 }
 

@@ -437,6 +437,34 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Rename an environment and update its path (for managed envs where dir is moved).
+    pub fn rename_environment_with_path(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        new_path: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE environments SET name = ?1, path = ?2, updated_at = CURRENT_TIMESTAMP WHERE name = ?3",
+            params![new_name, new_path, old_name],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Gets the path for an environment by name.
+    pub fn get_env_path(&self, name: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let path: Option<String> = conn
+            .query_row(
+                "SELECT path FROM environments WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(path)
+    }
+
     /// Lists all environments with basic info (name, path, python_version, updated_at, is_favorite).
     pub fn list_envs(
         &self,
@@ -673,6 +701,14 @@ impl Database {
         )?;
         conn.execute("DELETE FROM templates WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    /// Deletes all templates and their associated packages.
+    pub fn delete_all_templates(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM template_packages", [])?;
+        let count = conn.execute("DELETE FROM templates", [])?;
+        Ok(count)
     }
 
     /// Removes a single package from a template by name.

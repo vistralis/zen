@@ -45,7 +45,7 @@ src/
 ├── lib.rs              # Public re-exports for library consumers
 ├── ops.rs              # Operations layer — business logic entry point
 ├── db.rs               # SQLite persistence (environments, templates, links)
-├── mcp.rs              # MCP server (rmcp) — 23 tools over stdio
+├── mcp.rs              # MCP server (rmcp) — 11 tools over stdio
 ├── commands/            # CLI command implementations (26 modules)
 │   ├── mod.rs
 │   ├── activate.rs      # Smart project-aware activation

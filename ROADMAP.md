@@ -107,13 +107,16 @@
 
 ## v0.7.0 — Next Release
 
-- 📋 MCP API consolidation (27 → 10 tools) (#148) — action-dispatch pattern
-- 📋 PEP 440 version comparator via `pep440_rs` (#149) — fix false-positive health conflicts
-- 📋 JSON output for list/info (#39-40)
-- 📋 `zen health --fix` (#41)
-- 📋 SPDX headers on all `.rs` files (#108)
-- 📋 Dead code removal: model tracking, insight logging (#109)
-- 📋 L2: MCP path redaction — agents see `~/…/name` instead of full paths (#106)
+- ✅ MCP API consolidation (23 → 11 tools) (#148) — action-dispatch pattern
+- ✅ MCP structured JSON responses (#150) — agents get data, not prose
+- ✅ MCP install/uninstall split (#151) — separate tools for clarity
+- ✅ PEP 440 version comparator via `pep440_rs` (#149) — fix false-positive health conflicts
+- ✅ JSON output for list/info (#39-40)
+- ✅ `zen health --fix` (#41)
+- ✅ SPDX headers on all `.rs` files (#108)
+- ✅ Dead code removal: model tracking, insight logging (#109)
+- ✅ L2: MCP path redaction — agents see `~/…/name` instead of full paths (#106)
+- ✅ MCP `run_in_environment` log_path — full output capture to file
 
 ## v0.8.0 — Lifecycle & Discovery
 

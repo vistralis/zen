@@ -22,11 +22,12 @@ pub fn generate_hook(shell: &str) -> String {
         "zsh" | "bash" => {
             // Find the real binary path at hook-eval time
             r#"
-# Zen Shell Integration (v2)
+# Zen Shell Integration (v3)
 # Wraps zen binary so 'zen activate' modifies the current shell
 
 # Locate the real zen binary once
 __ZEN_BIN="$(command which zen 2>/dev/null)"
+__ZEN_ACTIVE_NAME=""
 
 zen() {
     local cmd="${1:-}"
@@ -47,8 +48,16 @@ zen() {
 
             if [ $rc -eq 0 ] && [ -n "$env_path" ] && [ -d "$env_path" ]; then
                 if [ -f "$env_path/bin/activate" ]; then
+                    # Determine display name: zen alias > basename
+                    local display_name="${env_name:-$(basename $env_path)}"
                     source "$env_path/bin/activate"
-                    echo "✓ Activated environment: $(basename $env_path)"
+                    # Override the prompt — activate hardcodes the dir name
+                    PS1="($display_name) ${_OLD_VIRTUAL_PS1:-}"
+                    export PS1
+                    VIRTUAL_ENV_PROMPT="($display_name) "
+                    export VIRTUAL_ENV_PROMPT
+                    __ZEN_ACTIVE_NAME="$display_name"
+                    echo "✓ Activated environment: $display_name"
                 else
                     echo "Error: Activation script not found at $env_path/bin/activate"
                     return 1
@@ -59,9 +68,10 @@ zen() {
             ;;
         deactivate)
             if [ -n "${VIRTUAL_ENV:-}" ]; then
-                local env_name=$(basename "$VIRTUAL_ENV")
+                local display_name="${__ZEN_ACTIVE_NAME:-$(basename "$VIRTUAL_ENV")}"
                 deactivate 2>/dev/null
-                echo "✓ Deactivated environment: $env_name"
+                __ZEN_ACTIVE_NAME=""
+                echo "✓ Deactivated environment: $display_name"
             else
                 echo "No active environment to deactivate."
             fi
@@ -86,9 +96,10 @@ zd() {
             .to_string()
         }
         "fish" => r#"
-# Zen Shell Integration for Fish (v2)
+# Zen Shell Integration for Fish (v3)
 
 set -g __ZEN_BIN (command which zen 2>/dev/null)
+set -g __ZEN_ACTIVE_NAME ""
 
 function zen --wraps zen
     set cmd $argv[1]
@@ -106,8 +117,17 @@ function zen --wraps zen
 
             if test $status -eq 0 -a -n "$env_path" -a -d "$env_path"
                 if test -f "$env_path/bin/activate.fish"
+                    # Determine display name: zen alias > basename
+                    if test -n "$env_name"
+                        set display_name "$env_name"
+                    else
+                        set display_name (basename $env_path)
+                    end
                     source "$env_path/bin/activate.fish"
-                    echo "✓ Activated environment: "(basename $env_path)
+                    # Override the prompt — activate hardcodes the dir name
+                    set -gx VIRTUAL_ENV_PROMPT "($display_name) "
+                    set -g __ZEN_ACTIVE_NAME "$display_name"
+                    echo "✓ Activated environment: $display_name"
                 else
                     echo "Error: Activation script not found at $env_path/bin/activate.fish"
                     return 1
@@ -115,9 +135,14 @@ function zen --wraps zen
             end
         case deactivate
             if set -q VIRTUAL_ENV
-                set env_name (basename $VIRTUAL_ENV)
+                if test -n "$__ZEN_ACTIVE_NAME"
+                    set display_name "$__ZEN_ACTIVE_NAME"
+                else
+                    set display_name (basename $VIRTUAL_ENV)
+                end
                 deactivate 2>/dev/null
-                echo "✓ Deactivated environment: $env_name"
+                set -g __ZEN_ACTIVE_NAME ""
+                echo "✓ Deactivated environment: $display_name"
             else
                 echo "No active environment to deactivate."
             end

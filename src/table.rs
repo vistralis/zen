@@ -20,11 +20,3 @@ pub fn new_table() -> Table {
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table
 }
-
-/// Creates a new styled table with custom headers.
-#[allow(dead_code)]
-pub fn new_table_with_headers(headers: Vec<&str>) -> Table {
-    let mut table = new_table();
-    table.set_header(headers);
-    table
-}

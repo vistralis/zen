@@ -389,7 +389,7 @@ fn test_utils_template_parsing() {
     let parts = zen::utils::parse_template_string("ml-base");
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0].name, "ml-base");
-    assert_eq!(parts[0].version, "latest");
+    assert_eq!(parts[0].version, "default");
 
     // Template with version
     let parts = zen::utils::parse_template_string("ml-base:1.0");
