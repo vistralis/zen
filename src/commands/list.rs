@@ -162,11 +162,22 @@ fn render_minimal(
     home: &std::path::Path,
 ) {
     // Pre-calculate all column widths
+    let home_prefix = home.to_string_lossy();
     let max_name = env_data
         .iter()
-        .map(|(name, _, _, _, is_fav, _, _)| {
+        .map(|(name, path, _, _, is_fav, _, _)| {
             let icon_w = if *is_fav { 2 } else { 0 };
-            name.len() + icon_w
+            let is_tracked = !path.starts_with(home_prefix.as_ref());
+            let tracked_w = if is_tracked {
+                let folder = std::path::Path::new(path.as_str())
+                    .file_name()
+                    .map(|f| f.to_string_lossy().len())
+                    .unwrap_or(0);
+                4 + folder // " → " + folder name
+            } else {
+                0
+            };
+            name.len() + icon_w + tracked_w
         })
         .max()
         .unwrap_or(12);
@@ -193,10 +204,20 @@ fn render_minimal(
     }
 
     for (name, path, py_ver, _exists, is_fav, versions, health) in env_data {
-        let name_display = if *is_fav {
-            format!("★ {}", name)
+        let is_tracked = !path.starts_with(home_prefix.as_ref());
+        let folder_suffix = if is_tracked {
+            let folder = std::path::Path::new(path.as_str())
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            format!(" → {}", folder)
         } else {
-            format!("  {}", name)
+            String::new()
+        };
+        let name_display = if *is_fav {
+            format!("★ {}{}", name, folder_suffix)
+        } else {
+            format!("  {}{}", name, folder_suffix)
         };
         // Health status — zen aesthetics
         let status_str = match health {
@@ -239,28 +260,18 @@ fn render_minimal(
             }
         }
 
-        let home_prefix = home.to_string_lossy();
-        let is_tracked = !path.starts_with(home_prefix.as_ref());
-
-        // For tracked envs, show path in the stack area instead of empty columns
-        let tracked_icon = if is_tracked {
-            format!(" {}", "↗".truecolor(180, 130, 255))
-        } else {
-            String::new()
-        };
         let (display_stack, display_path) = if long_format {
             (stack_str, format!("  {}", path.dimmed()))
         } else {
             (stack_str, String::new())
         };
         println!(
-            "{:<name_w$} {:<py_w$}{}{}{}{}",
+            "{:<name_w$} {:<py_w$}{}{}{}",
             name_display,
             py_ver.dimmed(),
             status_str,
             display_stack,
             display_path,
-            tracked_icon,
             name_w = max_name + 2,
             py_w = max_pyver,
         );
