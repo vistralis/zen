@@ -24,7 +24,7 @@ It also ships with a built-in [MCP server](docs/mcp.md), so AI coding agents can
 ## Install
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/vistralis/zen/main/install.sh | sh
+curl -sSf https://vistralis.org/zen/install.sh | sh
 ```
 
 Or build from source:

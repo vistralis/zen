@@ -1,9 +1,9 @@
 # Installation
 
-## Quick Install (coming soon)
+## Quick Install
 
 ```bash
-curl -sSL https://zen.dev/install | sh
+curl -sSf https://vistralis.org/zen/install.sh | sh
 ```
 
 ## From GitHub

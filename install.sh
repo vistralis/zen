@@ -1,6 +1,6 @@
 #!/bin/sh
 # Zen installer — https://github.com/vistralis/zen
-# Usage: curl -sSf https://raw.githubusercontent.com/vistralis/zen/main/install.sh | sh
+# Usage: curl -sSf https://vistralis.org/zen/install.sh | sh
 set -e
 
 REPO="vistralis/zen"
