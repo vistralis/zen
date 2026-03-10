@@ -120,10 +120,16 @@ fn test_list_status_verification() {
     let envs = ops.list_envs_with_status(None, None, None).unwrap();
     assert_eq!(envs.len(), 2);
 
-    let real_status = envs.iter().find(|(n, _, _, _, _, _)| n == "real").unwrap();
+    let real_status = envs
+        .iter()
+        .find(|(n, _, _, _, _, _, _)| n == "real")
+        .unwrap();
     assert!(real_status.3); // Exists
 
-    let fake_status = envs.iter().find(|(n, _, _, _, _, _)| n == "fake").unwrap();
+    let fake_status = envs
+        .iter()
+        .find(|(n, _, _, _, _, _, _)| n == "fake")
+        .unwrap();
     assert!(!fake_status.3); // Missing
 
     // Cleanup

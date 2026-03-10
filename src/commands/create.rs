@@ -17,8 +17,6 @@ pub fn run(
     user_python: Option<String>,
     template: Option<String>,
     strict: bool,
-    ml: bool,
-    cuda: Option<String>,
     rm: bool,
     rest: Vec<String>,
     home: &Path,
@@ -37,9 +35,6 @@ pub fn run(
     crate::validation::validate_name(&name, "Environment")?;
     if let Some(ref py) = user_python {
         crate::validation::validate_python_version(py)?;
-    }
-    if let Some(ref cuda_ver) = cuda {
-        crate::validation::validate_cuda_version(cuda_ver)?;
     }
 
     let mut python = user_python.clone().unwrap_or_else(|| "3.12".to_string());
@@ -330,41 +325,6 @@ pub fn run(
             "create",
             &format!("{} (Python {}){}", name, py_ver, tpl_log_info),
         );
-
-        // Install ML stack if requested
-        if ml {
-            let cuda_ver = cuda.unwrap_or_else(|| "12.6".to_string());
-            println!(
-                "\n{}",
-                "Installing ML stack (PyTorch + CUDA)...".bold().cyan()
-            );
-            let index_url = format!(
-                "https://download.pytorch.org/whl/cu{}",
-                cuda_ver.replace('.', "")
-            );
-            println!("  Using CUDA {} index: {}", cuda_ver, index_url);
-
-            let pip_path = env_path.join("bin").join("pip");
-            let result = std::process::Command::new(&pip_path)
-                .args([
-                    "install",
-                    "torch",
-                    "torchvision",
-                    "torchaudio",
-                    "--index-url",
-                    &index_url,
-                ])
-                .status();
-
-            match result {
-                Ok(status) if status.success() => {
-                    println!("{} ML stack installed successfully.", "✓".green());
-                }
-                _ => {
-                    eprintln!("{} ML stack installation failed.", "✗".red());
-                }
-            }
-        }
     } else {
         eprintln!("Failed to create environment.");
     }

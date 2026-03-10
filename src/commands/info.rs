@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::db::Database;
 use crate::ops::ZenOps;
 use crate::output::EnvDetails;
 use crate::types::HealthLevel;
@@ -9,7 +10,7 @@ use owo_colors::OwoColorize;
 use std::error::Error;
 
 /// Runs the `zen info <name>` command.
-pub fn run(ops: &ZenOps, name: &str, json: bool) -> Result<(), Box<dyn Error>> {
+pub fn run(ops: &ZenOps, db: &Database, name: &str, json: bool) -> Result<(), Box<dyn Error>> {
     let envs = ops.list_envs_with_status(None, None, None)?;
     let env = envs.iter().find(|(n, ..)| n == name);
 
@@ -25,6 +26,7 @@ pub fn run(ops: &ZenOps, name: &str, json: bool) -> Result<(), Box<dyn Error>> {
                     torch: None,
                     cuda: None,
                     numpy: None,
+                    is_protected: db.is_protected(name)?,
                 };
                 println!("{}", serde_json::to_string_pretty(&details)?);
             } else {
@@ -56,6 +58,7 @@ pub fn run(ops: &ZenOps, name: &str, json: bool) -> Result<(), Box<dyn Error>> {
                     torch: torch_ver,
                     cuda: cuda_ver,
                     numpy: get_ver("numpy"),
+                    is_protected: db.is_protected(name)?,
                 };
                 println!("{}", serde_json::to_string_pretty(&details)?);
                 return Ok(());
@@ -116,6 +119,11 @@ pub fn run(ops: &ZenOps, name: &str, json: bool) -> Result<(), Box<dyn Error>> {
                 }
             };
             println!("{}     {}", "Health:".bold(), health_str);
+
+            // Protection status
+            if db.is_protected(name)? {
+                println!("{}  {}", "Protected:".bold(), "🔒 yes".green());
+            }
 
             // Editable source packages
             let source: Vec<_> = packages

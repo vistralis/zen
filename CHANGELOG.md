@@ -4,6 +4,68 @@ All notable changes to Zen are documented here.
 
 ---
 
+## v0.7.1
+
+### Protected Environments
+
+Environments can now be marked as protected, preventing accidental removal.
+
+**New commands:**
+- `zen protect <name>` — mark an environment as protected (🔒)
+- `zen unprotect <name>` — remove protection from an environment
+- `zen rm` now refuses to remove protected environments unless `--force` is used
+
+**Visibility:**
+- 🔒 indicator appears in `zen list` and `zen info` for protected environments
+- `is_protected` field included in MCP environment details and JSON output
+
+### Shell Hook Improvements
+
+- Shell hooks upgraded to v4 — `za` menu selection now shows correct zen alias name instead of directory basename
+- Activation message now shows environment path: `✓ Activated environment: name (/path)`
+- Fixed `zen reset` message referencing removed `zen scan` command
+
+### Security
+
+- Remove `eval` in fish hook — use direct command substitution
+- Sanitize `display_name` for PS1 via `tr` allow-list
+- `is_protected` propagates DB errors instead of silent fallback
+
+### Internal
+
+- DB schema v5 (adds `is_protected` column with automatic migration from v4)
+- 109 tests passing (42 unit × 2 + 12 CLI + 13 integration)
+
+---
+
+## v0.7.0
+
+### MCP Architecture Overhaul
+
+The MCP server was completely redesigned around an action-dispatch pattern, reducing 23 individual tools to 11 consolidated tools. Each tool now accepts an `action` parameter and returns structured JSON instead of human-readable prose.
+
+**MCP changes:**
+- 23 → 11 tools via action-dispatch consolidation (#148)
+- Structured JSON responses for all tools (#150)
+- Install and uninstall split into separate tools (#151)
+- Path redaction — agents see `~/…/name` instead of full paths (#106)
+- `run_in_environment` log_path — full output capture to file
+
+**Code quality:**
+- SPDX license headers on all `.rs` source files (#108)
+- Dead code removal: model tracking and insight logging subsystems (#109)
+- PEP 440 version comparator via `pep440_rs` for accurate health checks (#149)
+- JSON output mode for `zen list` and `zen info` (#39, #40)
+- `zen health --fix` — automatic resolution of fixable issues (#41)
+
+### Internal
+
+- All MCP tools use `ZenOps::new_plain()` — no ANSI in structured responses
+- 94 tests passing
+- Clippy clean under `-D warnings`
+
+---
+
 ## v0.6.12
 
 ### Templates — Interactive REPL & Portability

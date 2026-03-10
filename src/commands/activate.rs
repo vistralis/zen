@@ -33,6 +33,7 @@ pub fn run(
                     activity_log::log_activity("cli", "activate", &env_name);
                 }
                 if path_only {
+                    println!("{}", env_name);
                     println!("{}", env_path);
                 } else {
                     eprintln!("✓ Last activated: {}", env_name);
@@ -62,6 +63,7 @@ pub fn run(
                 activity_log::log_activity("cli", "activate", env_name);
             }
             if path_only {
+                println!("{}", env_name);
                 println!("{}", path);
             } else {
                 eprintln!(
@@ -177,6 +179,7 @@ pub fn run(
                         }
                     );
                 }
+                println!("{}", env_name);
                 println!("{}", env_path);
             } else {
                 eprintln!("✓ Auto-selecting: {} ({})", env_name.cyan(), rel.dimmed());
@@ -234,6 +237,7 @@ pub fn run(
             let (env_name, env_path, _, _, _) = &valid[idx];
             let _ = db.record_activation(&cwd, env_name);
             if path_only {
+                println!("{}", env_name);
                 println!("{}", env_path);
             } else {
                 eprintln!("Selected: {}", env_name.cyan());

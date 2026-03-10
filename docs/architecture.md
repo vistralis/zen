@@ -45,7 +45,7 @@ src/
 ├── lib.rs              # Public re-exports for library consumers
 ├── ops.rs              # Operations layer — business logic entry point
 ├── db.rs               # SQLite persistence (environments, templates, links)
-├── mcp.rs              # MCP server (rmcp) — 11 tools over stdio
+├── mcp.rs              # MCP server (rmcp) — 11 action-dispatch tools over stdio
 ├── commands/            # CLI command implementations (26 modules)
 │   ├── mod.rs
 │   ├── activate.rs      # Smart project-aware activation
@@ -63,6 +63,7 @@ src/
 │   ├── find.rs          # Cross-environment package search
 │   ├── diff.rs          # Environment comparison
 │   ├── setup.rs         # Interactive setup wizards
+│   ├── protect.rs       # Mark environments as protected
 │   ├── note.rs          # Environment annotations
 │   ├── label.rs         # Environment tagging
 │   ├── status.rs        # System dashboard
@@ -89,15 +90,15 @@ src/
 
 | Module | Lines | % | Role |
 |--------|------:|--:|------|
-| `db.rs` | 1,393 | 13% | SQLite persistence (52 public methods) |
-| `mcp.rs` | 1,097 | 10% | MCP server (23 tools) |
-| `main.rs` | 1,096 | 10% | CLI definitions + thin dispatcher |
-| `utils.rs` | 1,002 | 9% | Package scanning, health, version comparison |
-| `commands/` | 3,920 | 35% | 26 command modules |
-| `ops.rs` | 827 | 7% | Operations layer (22 public methods) |
-| `repl.rs` | 816 | 7% | Template REPL engine |
-| Other | 991 | 9% | types, validation, error, hooks, context, etc. |
-| **Total** | **~11,142** | | |
+| `mcp.rs` | ~1,500 | 13% | MCP server (11 action-dispatch tools) |
+| `db.rs` | ~1,400 | 12% | SQLite persistence (52 public methods) |
+| `main.rs` | ~1,000 | 9% | CLI definitions + thin dispatcher |
+| `utils.rs` | ~900 | 8% | Package scanning, health, version comparison |
+| `commands/` | ~3,900 | 34% | 27 command modules |
+| `ops.rs` | ~800 | 7% | Operations layer (22 public methods) |
+| `repl.rs` | ~800 | 7% | Template REPL engine |
+| Other | ~1,200 | 10% | types, validation, error, hooks, context, output, table |
+| **Total** | **~11,800** | | |
 
 ## Data Flow
 
@@ -170,6 +171,7 @@ erDiagram
         text name UK
         text path
         text python_version
+        bool is_protected
     }
     templates {
         int id PK
@@ -204,7 +206,7 @@ erDiagram
 | `clap` | CLI argument parsing with derive macros |
 | `rmcp` | MCP server implementation (stdio transport) |
 | `rusqlite` | SQLite with bundled engine (no system dependency) |
-| `reqwest` | HTTP client (for install script downloads) |
+
 | `tokio` | Async runtime (required by rmcp) |
 | `comfy-table` | Terminal table rendering |
 | `rustyline` | Template REPL with history and line editing |
@@ -213,10 +215,10 @@ erDiagram
 
 ## Testing
 
-- **68 unit tests** across `types`, `validation`, `repl`, `context`, `error`, `db`
+- **84 unit tests** across `types`, `validation`, `repl`, `context`, `error`, `db` (42 × 2 targets)
 - **12 CLI integration tests** (`tests/cli_test.rs`) — spawn the binary, verify output
-- **14 database integration tests** (`tests/integration_test.rs`) — tempdir-based DB tests
-- All tests run in < 3 seconds
+- **13 database integration tests** (`tests/integration_test.rs`) — tempdir-based DB tests
+- **109 total tests**, all run in < 4 seconds
 
 ## Security Model
 

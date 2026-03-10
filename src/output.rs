@@ -30,6 +30,7 @@ pub struct EnvDetails {
     pub cuda: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub numpy: Option<String>,
+    pub is_protected: bool,
 }
 
 /// Single health check result.

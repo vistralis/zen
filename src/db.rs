@@ -39,7 +39,7 @@ pub struct Database {
 /// - v2: Added project_environments, comments tables (v0.3.0)
 /// - v3: Added labels table, removed dead tables
 /// - v4: Added activation history columns to project_environments (v0.6.5)
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 impl Database {
     /// Opens the Zen database at the specified path, or the default `~/.config/zen/zen.db`.
@@ -114,7 +114,8 @@ impl Database {
                 python_version TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                is_favorite INTEGER DEFAULT 0
+                is_favorite INTEGER DEFAULT 0,
+                is_protected INTEGER DEFAULT 0
             )",
             [],
         )?;
@@ -135,6 +136,11 @@ impl Database {
         // Migration: Ensure new columns exist
         let _ = conn.execute(
             "ALTER TABLE environments ADD COLUMN is_favorite INTEGER DEFAULT 0",
+            [],
+        );
+        // v0.7.1: Add is_protected column (same pattern as is_favorite)
+        let _ = conn.execute(
+            "ALTER TABLE environments ADD COLUMN is_protected INTEGER DEFAULT 0",
             [],
         );
         // Migration: Add install_args column for pip arguments (--index-url, etc.)
@@ -465,7 +471,7 @@ impl Database {
         Ok(path)
     }
 
-    /// Lists all environments with basic info (name, path, python_version, updated_at, is_favorite).
+    /// Lists all environments with basic info.
     pub fn list_envs(
         &self,
     ) -> Result<
@@ -475,20 +481,23 @@ impl Database {
             String, // python_version
             String, // updated_at
             bool,   // is_favorite
+            bool,   // is_protected
         )>,
     > {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT name, path, python_version, updated_at, is_favorite FROM environments",
+            "SELECT name, path, python_version, updated_at, is_favorite, is_protected FROM environments",
         )?;
         let rows = stmt.query_map([], |row| {
             let is_fav: i32 = row.get(4)?;
+            let is_prot: i32 = row.get(5)?;
             Ok((
                 row.get(0)?,
                 row.get(1)?,
                 row.get(2)?,
                 row.get(3)?,
                 is_fav == 1,
+                is_prot == 1,
             ))
         })?;
         let mut results = Vec::new();
@@ -496,6 +505,30 @@ impl Database {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    /// Sets the protected status for an environment.
+    pub fn set_protected(&self, name: &str, protected: bool) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE environments SET is_protected = ?1 WHERE name = ?2",
+            params![protected as i32, name],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Checks if an environment is protected.
+    pub fn is_protected(&self, name: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT COALESCE(is_protected, 0) FROM environments WHERE name = ?1",
+            params![name],
+            |row| row.get::<_, i32>(0),
+        ) {
+            Ok(val) => Ok(val == 1),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Creates a new template or returns the existing one.

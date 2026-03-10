@@ -33,9 +33,9 @@ pub fn run(yes: bool) -> Result<(), Box<dyn Error>> {
     }
 
     println!(
-        "\n{} Database reset. Run {} to rediscover environments.",
+        "\n{} Database reset. Environments will be rediscovered automatically on next {}.",
         "✓".green(),
-        "zen scan".cyan()
+        "zen list".cyan()
     );
     Ok(())
 }

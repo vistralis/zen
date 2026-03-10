@@ -118,6 +118,15 @@
 - ✅ L2: MCP path redaction — agents see `~/…/name` instead of full paths (#106)
 - ✅ MCP `run_in_environment` log_path — full output capture to file
 
+## v0.7.1 — Protected Environments
+
+- 💡 `zen protect <name>` / `zen unprotect <name>` — mark environments as protected
+- 💡 `zen rm` refuses to remove protected environments (prints 🔒 warning)
+- 💡 `zen rm --force` — override protection for intentional removal
+- 💡 `is_protected` column on `environments` table (same pattern as `is_favorite`)
+- 💡 🔒 indicator in `zen list` and `zen info` output
+- 💡 `is_protected` field in MCP environment details (no enforcement — agents trusted)
+
 ## v0.8.0 — Lifecycle & Discovery
 
 - 💡 `zen privacy` — configurable path recording rules with encrypted storage (#110)

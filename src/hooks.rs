@@ -22,7 +22,7 @@ pub fn generate_hook(shell: &str) -> String {
         "zsh" | "bash" => {
             // Find the real binary path at hook-eval time
             r#"
-# Zen Shell Integration (v3)
+# Zen Shell Integration (v4)
 # Wraps zen binary so 'zen activate' modifies the current shell
 
 # Locate the real zen binary once
@@ -37,27 +37,37 @@ zen() {
             shift
             local env_name="${1:-}"
 
-            # Query the real binary for the environment path
-            # Supports: zen activate <env>, zen activate (no args, menu), zen activate --last
+            # Query the real binary for the environment name and path
+            # Binary outputs two lines on stdout: name (line 1), path (line 2)
             local extra_args=""
             if [ -n "$env_name" ]; then
                 extra_args="$env_name"
             fi
-            local env_path=$("$__ZEN_BIN" activate $extra_args --path-only 2>/dev/tty)
+            local output=$("$__ZEN_BIN" activate $extra_args --path-only 2>/dev/tty)
+            # NOTE: $extra_args is intentionally unquoted — it is either empty
+            # (no word-splitting) or a single validated envname token. Zen's
+            # EnvName::new() rejects any name containing shell metacharacters,
+            # whitespace, or special characters, making injection impossible.
             local rc=$?
 
-            if [ $rc -eq 0 ] && [ -n "$env_path" ] && [ -d "$env_path" ]; then
-                if [ -f "$env_path/bin/activate" ]; then
-                    # Determine display name: zen alias > basename
-                    local display_name="${env_name:-$(basename $env_path)}"
+            if [ $rc -eq 0 ] && [ -n "$output" ]; then
+                local display_name
+                display_name=$(echo "$output" | head -1)
+                local env_path
+                env_path=$(echo "$output" | tail -1)
+
+                if [ -d "$env_path" ] && [ -f "$env_path/bin/activate" ]; then
                     source "$env_path/bin/activate"
                     # Override the prompt — activate hardcodes the dir name
-                    PS1="($display_name) ${_OLD_VIRTUAL_PS1:-}"
+                    # Sanitize display_name for PS1: strip any non-alphanumeric/dash/underscore/dot
+                    local safe_name
+                    safe_name=$(printf '%s' "$display_name" | tr -cd 'a-zA-Z0-9._-')
+                    PS1="($safe_name) ${_OLD_VIRTUAL_PS1:-}"
                     export PS1
                     VIRTUAL_ENV_PROMPT="($display_name) "
                     export VIRTUAL_ENV_PROMPT
                     __ZEN_ACTIVE_NAME="$display_name"
-                    echo "✓ Activated environment: $display_name"
+                    echo "✓ Activated environment: $display_name ($env_path)"
                 else
                     echo "Error: Activation script not found at $env_path/bin/activate"
                     return 1
@@ -96,7 +106,7 @@ zd() {
             .to_string()
         }
         "fish" => r#"
-# Zen Shell Integration for Fish (v3)
+# Zen Shell Integration for Fish (v4)
 
 set -g __ZEN_BIN (command which zen 2>/dev/null)
 set -g __ZEN_ACTIVE_NAME ""
@@ -108,26 +118,23 @@ function zen --wraps zen
         case activate
             set env_name $argv[2]
 
-            # Supports: zen activate <env>, zen activate (no args, menu), zen activate --last
+            # Binary outputs two lines on stdout: name (line 1), path (line 2)
             if test -n "$env_name"
-                set env_path (eval $__ZEN_BIN activate "$env_name" --path-only 2>/dev/tty)
+                set output ($__ZEN_BIN activate $env_name --path-only 2>/dev/tty)
             else
-                set env_path (eval $__ZEN_BIN activate --path-only 2>/dev/tty)
+                set output ($__ZEN_BIN activate --path-only 2>/dev/tty)
             end
 
-            if test $status -eq 0 -a -n "$env_path" -a -d "$env_path"
-                if test -f "$env_path/bin/activate.fish"
-                    # Determine display name: zen alias > basename
-                    if test -n "$env_name"
-                        set display_name "$env_name"
-                    else
-                        set display_name (basename $env_path)
-                    end
+            if test $status -eq 0 -a (count $output) -ge 2
+                set display_name $output[1]
+                set env_path $output[2]
+
+                if test -d "$env_path" -a -f "$env_path/bin/activate.fish"
                     source "$env_path/bin/activate.fish"
                     # Override the prompt — activate hardcodes the dir name
                     set -gx VIRTUAL_ENV_PROMPT "($display_name) "
                     set -g __ZEN_ACTIVE_NAME "$display_name"
-                    echo "✓ Activated environment: $display_name"
+                    echo "✓ Activated environment: $display_name ($env_path)"
                 else
                     echo "Error: Activation script not found at $env_path/bin/activate.fish"
                     return 1

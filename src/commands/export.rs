@@ -15,7 +15,7 @@ pub fn run(db: &Database, file: PathBuf) -> Result<(), Box<dyn Error>> {
 
     #[derive(serde::Serialize)]
     struct FullRegistry {
-        environments: Vec<(String, String, String, String, bool)>,
+        environments: Vec<(String, String, String, String, bool, bool)>,
         templates: Vec<TemplateExport>,
     }
 

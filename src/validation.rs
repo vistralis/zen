@@ -69,6 +69,7 @@ pub fn validate_python_version(version: &str) -> Result<(), String> {
 /// Validates a CUDA version string.
 ///
 /// Accepts formats like "12.6", "13.0", "11.8"
+#[allow(dead_code)]
 pub fn validate_cuda_version(version: &str) -> Result<(), String> {
     let parts: Vec<&str> = version.split('.').collect();
 

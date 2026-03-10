@@ -102,7 +102,7 @@ pub fn run(
     // Pre-scan all environments for package versions + health
     let env_data: Vec<_> = envs
         .iter()
-        .map(|(name, path, py_ver, exists, _updated, is_fav)| {
+        .map(|(name, path, py_ver, exists, _updated, is_fav, is_prot)| {
             let packages = crate::utils::get_packages(path);
             let versions: std::collections::HashMap<String, Option<String>> =
                 packages.into_iter().map(|p| (p.name, p.version)).collect();
@@ -118,6 +118,7 @@ pub fn run(
                 py_ver.clone(),
                 *exists,
                 *is_fav,
+                *is_prot,
                 versions,
                 health,
             )
@@ -154,6 +155,7 @@ fn render_minimal(
         String,
         bool,
         bool,
+        bool,
         std::collections::HashMap<String, Option<String>>,
         crate::types::HealthLevel,
     )],
@@ -165,8 +167,8 @@ fn render_minimal(
     let home_prefix = home.to_string_lossy();
     let max_name = env_data
         .iter()
-        .map(|(name, path, _, _, is_fav, _, _)| {
-            let icon_w = if *is_fav { 2 } else { 0 };
+        .map(|(name, path, _, _, is_fav, is_prot, _, _)| {
+            let icon_w = if *is_fav { 2 } else { 0 } + if *is_prot { 3 } else { 0 };
             let is_tracked = !path.starts_with(home_prefix.as_ref());
             let tracked_w = if is_tracked {
                 let folder = std::path::Path::new(path.as_str())
@@ -184,14 +186,14 @@ fn render_minimal(
 
     let max_pyver = env_data
         .iter()
-        .map(|(_, _, py_ver, _, _, _, _)| py_ver.len())
+        .map(|(_, _, py_ver, _, _, _, _, _)| py_ver.len())
         .max()
         .unwrap_or(4);
 
     // Pre-calculate max width per tracked package column
     let tracked_display: Vec<&str> = tracked_keys.iter().take(2).copied().collect();
     let mut max_col_widths: Vec<usize> = tracked_display.iter().map(|k| k.len()).collect();
-    for (_, _, _, _, _, versions, _) in env_data {
+    for (_, _, _, _, _, _, versions, _) in env_data {
         for (i, key) in tracked_display.iter().enumerate() {
             if let Some(Some(v)) = versions.get(*key) {
                 // key:version — plain width
@@ -203,7 +205,7 @@ fn render_minimal(
         }
     }
 
-    for (name, path, py_ver, _exists, is_fav, versions, health) in env_data {
+    for (name, path, py_ver, _exists, is_fav, is_prot, versions, health) in env_data {
         let is_tracked = !path.starts_with(home_prefix.as_ref());
         let folder_suffix = if is_tracked {
             let folder = std::path::Path::new(path.as_str())
@@ -214,10 +216,11 @@ fn render_minimal(
         } else {
             String::new()
         };
+        let prot_prefix = if *is_prot { "🔒 " } else { "" };
         let name_display = if *is_fav {
-            format!("★ {}{}", name, folder_suffix)
+            format!("★ {}{}{}", prot_prefix, name, folder_suffix)
         } else {
-            format!("  {}{}", name, folder_suffix)
+            format!("  {}{}{}", prot_prefix, name, folder_suffix)
         };
         // Health status — zen aesthetics
         let status_str = match health {
@@ -285,6 +288,7 @@ fn render_compact(
         String,
         bool,
         bool,
+        bool,
         std::collections::HashMap<String, Option<String>>,
         crate::types::HealthLevel,
     )],
@@ -318,11 +322,12 @@ fn render_compact(
     }
     table.set_header(header_row);
 
-    for (name, path, py_ver, _exists, is_fav, versions, health) in env_data {
+    for (name, path, py_ver, _exists, is_fav, is_prot, versions, health) in env_data {
         let home_prefix = home.to_string_lossy();
         let is_tracked = !path.starts_with(home_prefix.as_ref());
+        let prot_prefix = if *is_prot { "🔒 " } else { "" };
         let name_display = if *is_fav {
-            format!("★ {}", name)
+            format!("★ {}{}", prot_prefix, name)
         } else if is_tracked {
             let folder = std::path::Path::new(path.as_str())
                 .file_name()
@@ -386,6 +391,7 @@ fn render_wide(
         String,
         bool,
         bool,
+        bool,
         std::collections::HashMap<String, Option<String>>,
         crate::types::HealthLevel,
     )],
@@ -418,11 +424,12 @@ fn render_wide(
     }
     table.set_header(header_row);
 
-    for (name, path, py_ver, _exists, is_fav, versions, health) in env_data {
+    for (name, path, py_ver, _exists, is_fav, is_prot, versions, health) in env_data {
+        let prot_prefix = if *is_prot { "🔒 " } else { "" };
         let name_display = if *is_fav {
-            format!("★ {}", name)
+            format!("★ {}{}", prot_prefix, name)
         } else {
-            name.clone()
+            format!("{}{}", prot_prefix, name)
         };
 
         let health_cell = match health {
@@ -483,6 +490,7 @@ fn render_footer(
         String,
         bool,
         bool,
+        bool,
         std::collections::HashMap<String, Option<String>>,
         crate::types::HealthLevel,
     )],
@@ -490,23 +498,23 @@ fn render_footer(
     let total = env_data.len();
     let n_fav = env_data
         .iter()
-        .filter(|(_, _, _, _, fav, _, _)| *fav)
+        .filter(|(_, _, _, _, fav, _, _, _)| *fav)
         .count();
     let n_pass = env_data
         .iter()
-        .filter(|(_, _, _, _, _, _, h)| *h == crate::types::HealthLevel::Pass)
+        .filter(|(_, _, _, _, _, _, _, h)| *h == crate::types::HealthLevel::Pass)
         .count();
     let n_info = env_data
         .iter()
-        .filter(|(_, _, _, _, _, _, h)| *h == crate::types::HealthLevel::Info)
+        .filter(|(_, _, _, _, _, _, _, h)| *h == crate::types::HealthLevel::Info)
         .count();
     let n_warn = env_data
         .iter()
-        .filter(|(_, _, _, _, _, _, h)| *h == crate::types::HealthLevel::Warn)
+        .filter(|(_, _, _, _, _, _, _, h)| *h == crate::types::HealthLevel::Warn)
         .count();
     let n_fail = env_data
         .iter()
-        .filter(|(_, _, _, _, _, _, h)| *h == crate::types::HealthLevel::Fail)
+        .filter(|(_, _, _, _, _, _, _, h)| *h == crate::types::HealthLevel::Fail)
         .count();
 
     print!("{}", format!("{} environments", total).dimmed());

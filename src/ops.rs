@@ -50,10 +50,22 @@ impl<'a> ZenOps<'a> {
             String, // python_version
             String, // updated_at
             bool,   // is_favorite
+            bool,   // is_protected
         )>,
         Box<dyn Error>,
     > {
         self.db.list_envs()
+    }
+
+    /// Sets the protected status for an environment.
+    pub fn protect_env(&self, name: &str, protected: bool) -> Result<bool, Box<dyn Error>> {
+        self.db.set_protected(name, protected)
+    }
+
+    /// Checks if an environment is protected.
+    #[allow(dead_code)]
+    pub fn is_protected(&self, name: &str) -> Result<bool, Box<dyn Error>> {
+        self.db.is_protected(name)
     }
 
     /// Removes an environment from the database and deletes it from disk.
@@ -466,7 +478,7 @@ impl<'a> ZenOps<'a> {
 
     /// Lists all environments and verifies their existence on the local filesystem.
     ///
-    /// Returns a tuple of (name, path, python_version, exists, updated_at, is_favorite).
+    /// Returns a tuple of (name, path, python_version, exists, updated_at, is_favorite, is_protected).
     pub fn list_envs_with_status(
         &self,
         filter: Option<&str>,
@@ -480,6 +492,7 @@ impl<'a> ZenOps<'a> {
             bool,   // exists
             String, // updated_at
             bool,   // is_favorite
+            bool,   // is_protected
         )>,
         Box<dyn Error>,
     > {
@@ -512,9 +525,9 @@ impl<'a> ZenOps<'a> {
         }
 
         let mut results = Vec::new();
-        for (name, path, py_ver, updated, is_fav) in envs {
+        for (name, path, py_ver, updated, is_fav, is_prot) in envs {
             let exists = Path::new(&path).join("bin").join("python").exists();
-            results.push((name, path, py_ver, exists, updated, is_fav));
+            results.push((name, path, py_ver, exists, updated, is_fav, is_prot));
         }
 
         Ok(results)

@@ -10,8 +10,8 @@ Create a new Python environment.
 ```bash
 zen create myproject                    # Use system default Python
 zen create myproject --python 3.10      # Specific Python version
-zen create myproject --template ml-base # From a saved template
-zen create myproject --ml --cuda 12.8   # With PyTorch + CUDA
+zen create myproject --from ml-base     # From a saved template
+zen create myproject --from ml,extras   # Multiple templates (comma-separated)
 ```
 
 ### `zen add <path>`
@@ -30,6 +30,15 @@ Remove an environment from disk and database.
 zen rm myproject          # Asks for confirmation
 zen rm myproject --yes    # Skip confirmation
 zen rm myproject --cached # Remove from database only, keep files on disk
+zen rm myproject --force  # Required for protected environments
+```
+
+### `zen protect <name>` / `zen unprotect <name>`
+Mark an environment as protected (🔒) to prevent accidental removal.
+
+```bash
+zen protect production     # Now requires --force to remove
+zen unprotect production   # Remove protection
 ```
 
 ### `zen rename <old> <new>`

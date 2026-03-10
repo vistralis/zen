@@ -182,6 +182,14 @@
 | 162 | CLI tests for `--json` and `--fix` | testing | 🟡 | 🟢 | low | 📋 | — | — | — | `zen list --json`, `zen info --json`, and `zen health --fix` lacking CLI test coverage. Flagged by Copilot; deferred as nice-to-have test coverage improvement. |
 | 163 | Tracked-vs-managed path detection | cli | 🟡 | 🟡 | mid | 📋 | — | — | — | `is_tracked` uses string `starts_with` on paths, which can misclassify envs whose names share a common prefix with `ZEN_HOME`. Fix: use canonical path comparison. Flagged by Copilot; deferred — false positives only with overlapping directory names (unlikely in practice). |
 | 164 | `cargo audit` blocking in CI | infra | 🟡 | 🟢 | low | 📋 | — | — | — | CI security audit step is non-blocking (`|| echo`). Flagged by Copilot; intentionally non-blocking — advisories ≠ vulnerabilities, and failing CI on unmaintained-but-safe deps would block releases. |
+| 165 | `zen protect <name>` | safety | 🟠 | 🟢 | low | ✅ | 0.7.1 | 0.7.1 | — | Mark environment as protected (🔒) |
+| 166 | `zen unprotect <name>` | safety | 🟠 | 🟢 | low | ✅ | 0.7.1 | 0.7.1 | — | Remove protection from environment |
+| 167 | `zen rm` protected-env enforcement | safety | 🔴 | 🟢 | low | ✅ | 0.7.1 | 0.7.1 | — | Refuses removal of protected envs unless `--force` is used |
+| 168 | `is_protected` DB column | infra | 🟠 | 🟢 | low | ✅ | 0.7.1 | 0.7.1 | — | Schema v5; auto-migrated from v4 via `ALTER TABLE` |
+| 169 | 🔒 indicator in `zen list` / `zen info` | output | 🟡 | 🟢 | low | ✅ | 0.7.1 | 0.7.1 | — | Visual protection indicator in CLI and `--json` |
+| 170 | `is_protected` in MCP environment details | mcp | 🟡 | 🟢 | low | ✅ | 0.7.1 | 0.7.1 | — | No enforcement — agents trusted |
+| 171 | Shell hook v4 — name+path protocol | shell | 🟠 | 🟡 | low | ✅ | 0.7.1 | 0.7.1 | v3 hooks | `--path-only` outputs name then path; hook reads both — fixes `za` display name bug |
+| 172 | Fix stale `zen scan` in reset message | ux | 🟢 | 🟢 | low | ✅ | 0.7.1 | 0.7.1 | — | Now says "zen list" instead of removed command |
 
 ---
 

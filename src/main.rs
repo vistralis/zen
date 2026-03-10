@@ -78,14 +78,6 @@ enum Commands {
         #[arg(long)]
         strict: bool,
 
-        /// Install ML stack (PyTorch, torchvision, torchaudio)
-        #[arg(long)]
-        ml: bool,
-
-        /// CUDA version for ML stack (requires --ml, e.g., "12.6", "12.8", "13.0")
-        #[arg(long, requires = "ml")]
-        cuda: Option<String>,
-
         /// Remove existing environment with the same name before creating
         #[arg(long)]
         rm: bool,
@@ -143,6 +135,19 @@ enum Commands {
         /// Remove from database only, keep files on disk
         #[arg(long)]
         cached: bool,
+        /// Override protection (required for protected environments)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Mark an environment as protected (prevents accidental removal)
+    Protect {
+        /// Name of the environment to protect
+        name: EnvName,
+    },
+    /// Remove protection from an environment
+    Unprotect {
+        /// Name of the environment to unprotect
+        name: EnvName,
     },
     /// Add packages to an environment (or active session)
     ///
@@ -789,8 +794,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 python: user_python,
                 template,
                 strict,
-                ml,
-                cuda,
                 rm,
                 rest,
             } => {
@@ -801,8 +804,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     user_python,
                     template,
                     strict,
-                    ml,
-                    cuda,
                     rm,
                     rest,
                     &cli.home,
@@ -853,8 +854,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     json,
                 )?;
             }
-            Commands::Rm { name, yes, cached } => {
-                commands::rm::run(&ops, &db, &name, yes, cached, &cli.home)?;
+            Commands::Rm {
+                name,
+                yes,
+                cached,
+                force,
+            } => {
+                commands::rm::run(&ops, &db, &name, yes, cached, force, &cli.home)?;
+            }
+            Commands::Protect { name } => {
+                commands::protect::protect(&ops, &name)?;
+            }
+            Commands::Unprotect { name } => {
+                commands::protect::unprotect(&ops, &name)?;
             }
             Commands::Config { key, value } => {
                 commands::config::run(&db, key, value)?;
@@ -965,7 +977,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Commands::Info { name, json } => {
                 let name = resolve_env_name(name, &db)?;
-                commands::info::run(&ops, &name, json)?;
+                commands::info::run(&ops, &db, &name, json)?;
             }
             Commands::Status => {
                 let db_path = cli.db_path.clone().unwrap_or_else(|| {

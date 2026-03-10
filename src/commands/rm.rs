@@ -15,6 +15,7 @@ pub fn run(
     name: &EnvName,
     yes: bool,
     cached: bool,
+    force: bool,
     home: &Path,
 ) -> Result<(), Box<dyn Error>> {
     // Check existence before prompting
@@ -24,6 +25,20 @@ pub fn run(
     if !in_db && !on_disk {
         activity_log::log_activity("cli", "rm:error", &format!("{} - not found", name));
         eprintln!("{} Environment '{}' not found.", "Error:".red(), name);
+        return Ok(());
+    }
+
+    // Protection guard — refuse unless --force is passed
+    if in_db
+        && !force
+        && let Ok(true) = db.is_protected(name)
+    {
+        eprintln!(
+            "🔒 Environment '{}' is protected. Use {} to override.",
+            name.to_string().bold(),
+            "--force".bold()
+        );
+        activity_log::log_activity("cli", "rm:blocked", &format!("{} - protected", name));
         return Ok(());
     }
     if !yes {

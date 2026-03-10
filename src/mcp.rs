@@ -1057,6 +1057,11 @@ impl ZenMcpServer {
                             .find(|p| p.name == "numpy")
                             .and_then(|p| p.version.clone());
 
+                        let is_protected = match db.is_protected(name) {
+                            Ok(p) => p,
+                            Err(e) => return mcp_sys_err(e),
+                        };
+
                         McpResponse::ok(EnvDetails {
                             name: name.clone(),
                             python: py_ver.clone(),
@@ -1066,6 +1071,7 @@ impl ZenMcpServer {
                             torch,
                             cuda,
                             numpy,
+                            is_protected,
                         })
                     }
                     None => mcp_not_found("Environment", env_name.as_str()),

@@ -23,6 +23,7 @@ pub mod link;
 pub mod list;
 pub mod log;
 pub mod note;
+pub mod protect;
 pub mod rename;
 pub mod reset;
 pub mod rm;
